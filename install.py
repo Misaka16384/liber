@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Zero-dependency cross-platform installer for /write-paper v2.
+"""Liber: zero-dependency cross-platform installer for the /write-paper skill.
 
 Installs `skills/write-paper` cleanly into global or project-scoped directories for:
   - Claude Code      (~/.claude/skills/write-paper)
@@ -204,7 +204,7 @@ def resolve_hosts(hosts_arg: str, table: Dict[str, Dict[str, object]]) -> List[s
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Universal installer for the /write-paper v2 multi-agent skill.")
+    ap = argparse.ArgumentParser(description="Liber installer for the /write-paper multi-agent skill.")
     ap.add_argument("--hosts", default="auto", help="Comma-separated hosts (claude,codex,antigravity,opencode,qwen), 'auto', or 'all'.")
     ap.add_argument("--project", type=Path, help="Install into project-scoped directories instead of user home (~/.claude, ~/.gemini, etc.).")
     ap.add_argument("--mode", choices=["copy", "link"], default="copy", help="Install via clean copy (default) or symlink/Windows junction.")

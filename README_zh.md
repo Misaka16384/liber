@@ -1,35 +1,53 @@
-# `/write-paper` v2 —— 通用跨 Agent 理论物理论文写作与确定性审计工作流
+# Liber —— 理论物理论文写作 skill `/write-paper`
 
 *[English](README.md) | [中文说明](README_zh.md)*
 
-一套模块化、支持任意阶段按需重入的理论物理与数学物理 LaTeX 论文工作流与确定性验证工具链，原生兼容 **Claude Code**、**OpenAI Codex CLI**、**Google Antigravity（IDE 与 `agy` CLI）**、**OpenCode**、**Qwen**、**`npx skills add`** 及 **独立 Python CLI**。
+**Liber**（拉丁文，原指树皮内层，古人在上面写字，后来引申为“书”）提供一个 skill：**`/write-paper`**。
+
+**一键安装**（自动装进本机找到的所有 Agent：Claude Code、Antigravity、Codex、OpenCode、Qwen）：
+
+```powershell
+# Windows（PowerShell）
+irm https://raw.githubusercontent.com/Misaka16384/liber/master/install.ps1 | iex
+```
+
+```bash
+# macOS / Linux / Git Bash
+curl -fsSL https://raw.githubusercontent.com/Misaka16384/liber/master/install.sh | sh
+```
+
+装好后新开一个 Agent 会话，输入 `/write-paper` 即可。需要 Python 3.8 以上；编译相关阶段还需要 TeX 发行版（`pdflatex`、`bibtex`）。再运行一次同一条命令就是更新。
+
+`/write-paper` 是一套模块化、支持任意阶段按需重入的理论物理与数学物理 LaTeX 论文工作流与确定性验证工具链，原生兼容 **Claude Code**、**OpenAI Codex CLI**、**Google Antigravity（IDE 与 `agy` CLI）**、**OpenCode**、**Qwen**、**`npx skills add`** 及 **独立 Python CLI**。
 
 与只靠单轮大模型生成或强行拆短句“降 4-gram AI 率”的思路相反，`/write-paper` v2 强调 **真实严谨性与正收益确定性门禁**：**不可变真值与逻辑量词锁表（`00_locks.json` + `--check-quantifiers`）**、**基于本组旧论文的 Few-Shot 语感仿写**、***PRL* / *Nature* 期刊级图件视觉语言 + PyMuPDF/AST 硬门禁**、**双向 DOI + arXiv + `.bbl` 引用审计**、**上下文完全隔离的三方模拟盲审** 与 **带全量快照的局部修补（`repair`）**。
 
 ---
 
-## 一键安装
+## 安装
 
+### 1. 一行命令安装（推荐）
+自动下载 Liber，把 `/write-paper` 部署到 `~/.claude/skills/`、`~/.codex/skills/`、`~/.agents/skills/`、`~/.gemini/config/skills/` 与 `~/.config/opencode/`。如果你本地改过已安装的版本，会先自动备份。
+
+**Windows（PowerShell）：**
+```powershell
+irm https://raw.githubusercontent.com/Misaka16384/liber/master/install.ps1 | iex
+# 带参数（只装部分 Agent，并顺便安装 Python 依赖 pymupdf, matplotlib, sympy, numpy, Pillow）：
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Misaka16384/liber/master/install.ps1))) -Hosts claude,antigravity -WithDeps
+```
+
+**macOS / Linux / Git Bash：**
+```bash
+curl -fsSL https://raw.githubusercontent.com/Misaka16384/liber/master/install.sh | sh
+# 带参数：
+curl -fsSL https://raw.githubusercontent.com/Misaka16384/liber/master/install.sh | INSTALL_DEPS=1 sh -s -- --hosts claude,antigravity
+```
+
+**从克隆目录安装**（需要 `--mode link` 软链接、让 Agent 直接用你的工作副本时用这种）：
 ```bash
 git clone https://github.com/Misaka16384/liber.git
 cd liber
-```
-
-### 1. 自动安装到本机所有已装 Agent（推荐）
-自动探测并将 `skills/write-paper` 部署到 `~/.claude/skills/`、`~/.codex/skills/`、`~/.agents/skills/`、`~/.gemini/config/skills/` 与 `~/.config/opencode/`：
-
-**Windows (PowerShell)：**
-```powershell
-.\install.ps1
-# 如需顺便安装 Python 依赖（pymupdf, matplotlib, sympy, numpy, Pillow）：
-.\install.ps1 -WithDeps
-```
-
-**macOS / Linux：**
-```bash
-sh install.sh
-# 或附带安装 Python 依赖：
-INSTALL_DEPS=1 sh install.sh
+sh install.sh          # Windows 上用 .\install.ps1
 ```
 
 **指定宿主 / 软链接模式 / 仅项目级安装：**
@@ -40,9 +58,9 @@ python install.py --project /path/to/my-paper-repo
 
 ### 2. Claude Code `/plugin` 或 `skills` CLI
 ```text
-# 在 Claude Code 内通过插件安装：
+# 在 Claude Code 内通过插件安装（装好后 skill 显示为 /liber:write-paper）：
 /plugin marketplace add Misaka16384/liber
-/plugin install write-paper@write-paper
+/plugin install liber@liber
 
 # 或使用 npx skills（指向你克隆下来的目录）：
 npx skills add /path/to/liber -y

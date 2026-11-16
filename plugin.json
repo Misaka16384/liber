@@ -1,11 +1,11 @@
 {
-  "name": "write-paper",
-  "displayName": "Write Paper (Theoretical Physics v2)",
-  "description": "Modular, re-entrant LaTeX drafting and deterministic audit suite for theoretical & mathematical physics papers (PRL/Nature figure geometry, dual DOI/arXiv/.bbl checks, quantifier locks, and blind refereeing).",
+  "name": "liber",
+  "displayName": "Liber: /write-paper (Theoretical Physics)",
+  "description": "Liber ships the /write-paper skill: modular, re-entrant LaTeX drafting and deterministic audit suite for theoretical & mathematical physics papers (PRL/Nature figure geometry, dual DOI/arXiv/.bbl checks, quantifier locks, and blind refereeing).",
   "version": "2.1.0",
   "logo": "assets/logo.svg",
   "author": {
-    "name": "write-paper contributors"
+    "name": "liber contributors"
   },
   "suggestedPrompts": [
     "Draft a PRL Letter from our derivation notes using /write-paper",

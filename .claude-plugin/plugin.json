@@ -1,9 +1,9 @@
 {
-  "name": "write-paper",
-  "description": "Modular, re-entrant theoretical & mathematical physics LaTeX paper workflow with PyMuPDF figure verification, dual DOI/arXiv/.bbl citation audit, quantifier lock, and cross-vendor blind refereeing.",
+  "name": "liber",
+  "description": "Liber: the /write-paper skill, a modular, re-entrant theoretical & mathematical physics LaTeX paper workflow with PyMuPDF figure verification, dual DOI/arXiv/.bbl citation audit, quantifier lock, and cross-vendor blind refereeing.",
   "version": "2.1.0",
   "author": {
-    "name": "write-paper contributors"
+    "name": "liber contributors"
   },
   "license": "MIT",
   "skills": "./skills"

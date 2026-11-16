@@ -1,13 +1,13 @@
 {
-  "name": "write-paper",
+  "name": "liber",
   "owner": {
-    "name": "write-paper contributors"
+    "name": "liber contributors"
   },
-  "description": "Universal cross-agent LaTeX drafting, PRL/Nature figure geometry checking, citation verification, and blind refereeing skill for physics manuscripts.",
+  "description": "Liber: cross-agent LaTeX paper workflow for theoretical physics. Ships the /write-paper skill (drafting, PRL/Nature figure geometry checks, citation verification, blind refereeing).",
   "plugins": [
     {
-      "name": "write-paper",
-      "description": "Theoretical & mathematical physics LaTeX workflow (/write-paper v2)",
+      "name": "liber",
+      "description": "The /write-paper skill: theoretical & mathematical physics LaTeX workflow with deterministic verification gates",
       "source": "./"
     }
   ]

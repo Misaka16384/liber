@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "write-paper-skill"
+name = "liber-paper"
 version = "2.1.0"
 description = "Universal cross-agent LaTeX workflow & deterministic verification suite for theoretical and mathematical physics papers."
 readme = "README.md"

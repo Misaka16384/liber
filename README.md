@@ -1,10 +1,26 @@
-# `/write-paper` v2 — Universal Theoretical Physics Paper Workflow & Audit Suite
+# Liber — the `/write-paper` skill for theoretical physics papers
 
 *[English](README.md) | [中文说明](README_zh.md)*
 
-A modular, re-entrant LaTeX drafting and deterministic verification workflow for theoretical and mathematical physics manuscripts. Works across **Claude Code**, **OpenAI Codex CLI**, **Google Antigravity (IDE & `agy` CLI)**, **OpenCode**, **Qwen**, **`npx skills add`**, and **standalone Python CLI**.
+**Liber** (Latin for the inner bark that early books were written on, and later for "book") ships one skill, **`/write-paper`**: a modular, re-entrant LaTeX drafting and deterministic verification workflow for theoretical and mathematical physics manuscripts.
 
-Instead of trusting single-pass LLM drafting or cosmetic prose perturbations, `write-paper` v2 combines **immutable Ground-Truth / Quantifier locks**, **Few-Shot exemplar voice learning**, **publication-grade *PRL* / *Nature* figure verification (PyMuPDF + AST)**, **bidirectional DOI + arXiv + `.bbl` auditing**, **context-isolated three-role blind refereeing**, and **checkpointed partial repair**.
+**One-line install** (installs `/write-paper` into every agent it finds: Claude Code, Antigravity, Codex, OpenCode, Qwen):
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/Misaka16384/liber/master/install.ps1 | iex
+```
+
+```bash
+# macOS / Linux / Git Bash
+curl -fsSL https://raw.githubusercontent.com/Misaka16384/liber/master/install.sh | sh
+```
+
+Then start a new agent session and type `/write-paper`. Needs Python 3.8+; a TeX distribution (`pdflatex`, `bibtex`) is needed for the build stages. Run the same line again to update.
+
+`/write-paper` works across **Claude Code**, **OpenAI Codex CLI**, **Google Antigravity (IDE & `agy` CLI)**, **OpenCode**, **Qwen**, **`npx skills add`**, and **standalone Python CLI**.
+
+Instead of trusting single-pass LLM drafting or cosmetic prose perturbations, `/write-paper` v2 combines **immutable Ground-Truth / Quantifier locks**, **Few-Shot exemplar voice learning**, **publication-grade *PRL* / *Nature* figure verification (PyMuPDF + AST)**, **bidirectional DOI + arXiv + `.bbl` auditing**, **context-isolated three-role blind refereeing**, and **checkpointed partial repair**.
 
 ---
 
@@ -27,26 +43,28 @@ flowchart LR
 
 ## Installation
 
-```bash
-git clone https://github.com/Misaka16384/liber.git
-cd liber
-```
-
-### 1. Universal Auto-Installer (Recommended)
-Installs cleanly into all detected agents on your machine (`~/.claude/skills/`, `~/.codex/skills/`, `~/.agents/skills/`, `~/.gemini/config/skills/`, `~/.config/opencode/`):
+### 1. One-line installer (Recommended)
+Downloads Liber and installs `/write-paper` into all detected agents (`~/.claude/skills/`, `~/.codex/skills/`, `~/.agents/skills/`, `~/.gemini/config/skills/`, `~/.config/opencode/`); an existing install that you edited locally is backed up first.
 
 **Windows (PowerShell):**
 ```powershell
-.\install.ps1
-# Optional: also install Python dependencies (pymupdf, matplotlib, sympy, numpy, Pillow)
-.\install.ps1 -WithDeps
+irm https://raw.githubusercontent.com/Misaka16384/liber/master/install.ps1 | iex
+# With options (only some agents, plus the Python dependencies pymupdf, matplotlib, sympy, numpy, Pillow):
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Misaka16384/liber/master/install.ps1))) -Hosts claude,antigravity -WithDeps
 ```
 
-**macOS / Linux:**
+**macOS / Linux / Git Bash:**
 ```bash
-sh install.sh
-# Optional: install Python dependencies first
-INSTALL_DEPS=1 sh install.sh
+curl -fsSL https://raw.githubusercontent.com/Misaka16384/liber/master/install.sh | sh
+# With options:
+curl -fsSL https://raw.githubusercontent.com/Misaka16384/liber/master/install.sh | INSTALL_DEPS=1 sh -s -- --hosts claude,antigravity
+```
+
+**From a clone** (needed for `--mode link`, which keeps the agents pointing at your checkout):
+```bash
+git clone https://github.com/Misaka16384/liber.git
+cd liber
+sh install.sh          # or .\install.ps1 on Windows
 ```
 
 **Direct Python (`copy` or `link`, global or project-scoped):**
@@ -57,9 +75,9 @@ python install.py --project /path/to/my-paper-repo
 
 ### 2. Claude Code `/plugin` or Vercel `skills` CLI
 ```text
-# Inside Claude Code interactive session
+# Inside Claude Code interactive session (the skill then appears as /liber:write-paper)
 /plugin marketplace add Misaka16384/liber
-/plugin install write-paper@write-paper
+/plugin install liber@liber
 
 # Or via skills CLI (project or global), from your clone
 npx skills add /path/to/liber -y
