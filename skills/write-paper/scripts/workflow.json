@@ -1,0 +1,161 @@
+{
+  "name": "write-paper",
+  "description": "Modular, re-entrant theoretical physics LaTeX paper workflow (v2): GT/CS locks, reverse-audited blueprint, Few-Shot exemplar drafting, PRL/Nature figure geometry & AST verification, 3-way verification, dual DOI+arXiv+.bbl citation audit, positive-ROI prose hygiene, blind referee gate, and targeted repair.",
+  "entry": "paper_workflow.py",
+  "args": {
+    "type": "object",
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": [
+          "inventory",
+          "blueprint",
+          "draft",
+          "figures",
+          "verify",
+          "citations",
+          "hygiene",
+          "build",
+          "blind_referee",
+          "repair",
+          "draft_and_audit",
+          "audit_polish",
+          "full_auto",
+          "smoke_test"
+        ],
+        "description": "On-demand modular execution phase or composite pipeline."
+      },
+      "paper_dir": {
+        "type": "string",
+        "description": "Target LaTeX paper project root directory."
+      },
+      "source_paths": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Directories or files containing core derivation notes, reports, verification scripts, and figures."
+      },
+      "authority_paths": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Highest-authority ground-truth scope, redline, and numeric protocol documents used to lock 00_locks.json and reverse-check blueprints."
+      },
+      "exemplar_paths": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Reference exemplar papers (.tex or .pdf) authored by the group for Few-Shot voice learning and vetted connector profiling."
+      },
+      "existing_bib": {
+        "type": "string",
+        "description": "Optional path to an existing .bib file to seed citation verification."
+      },
+      "genre": {
+        "type": "string",
+        "enum": ["letter", "long"],
+        "default": "long",
+        "description": "Target venue format: 'letter' (PRL + SuppMat) or 'long' (PRB/PRX/CMP + Appendices)."
+      },
+      "figure_style": {
+        "type": "string",
+        "enum": ["prl", "nature"],
+        "default": "prl",
+        "description": "Journal visual style preset for figures phase and verify_figures.py."
+      },
+      "blueprint_path": {
+        "type": "string",
+        "description": "Optional explicit path to 01_blueprint.json (defaults to <paper_dir>/.workflow/01_blueprint.json)."
+      },
+      "supplement_tex": {
+        "type": "string",
+        "description": "Optional path to Supplemental Material .tex (defaults to <paper_dir>/supplement.tex if present)."
+      },
+      "figure_specs_path": {
+        "type": "string",
+        "description": "Optional JSON file describing target figures, CSV/data inputs, and captions."
+      },
+      "skill_dir": {
+        "type": "string",
+        "description": "Optional explicit path to the write-paper skill directory."
+      },
+      "repair_instructions": {
+        "type": "string",
+        "description": "Path to a review/audit report (.md/.txt) or inline change instructions for mode='repair'."
+      },
+      "repair_files": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional subset of files to target in mode='repair' (relative to paper_dir or absolute)."
+      },
+      "routing_policy": {
+        "type": "string",
+        "enum": ["auto_tiered", "uniform_inherit"],
+        "default": "auto_tiered",
+        "description": "auto_tiered: each call is routed by its task tier (heavy / builder / fast / probe) to a model per runtime; uniform_inherit: every call uses the host/CLI default. An explicit models[stage] always wins."
+      },
+      "plan_mode": {
+        "type": "string",
+        "enum": ["auto", "on", "off"],
+        "default": "auto",
+        "description": "Antigravity only: whether run_workflow was called from a Planning Turn. 'auto' reads it from trajectory(); 'off' (Execution Turn) sends inherit-tier calls to the standalone agy CLI (or model='pro' without it), because an inherit sub-agent deadlocks on '[plan review due]' there."
+      },
+      "repair_skip_plan": {
+        "type": "boolean",
+        "default": false,
+        "description": "mode='repair': skip the LLM planner and give every file in repair_files the full instructions (automatic when repair_files has exactly one file)."
+      },
+      "sync_bib": {
+        "type": "string",
+        "description": "Optional updated .bib file to sync into refs.bib during repair or citations."
+      },
+      "max_parallel": {
+        "type": "integer",
+        "default": 4,
+        "minimum": 1,
+        "maximum": 8,
+        "description": "Maximum concurrent agent calls per batch (default 4 to avoid RPC subscriber stalls)."
+      },
+      "agent_timeout_s": {
+        "type": "integer",
+        "default": 1800,
+        "minimum": 60,
+        "description": "Wall-clock limit for one agent call: Antigravity agent(...) handles are abandoned with an error, CLI backends have their whole process tree killed. Timed-out calls are never retried (they may already have edited files)."
+      },
+      "agent_retries": {
+        "type": "integer",
+        "default": 2,
+        "minimum": 0,
+        "maximum": 5,
+        "description": "Retries for a failed or timed-out agent call (rate limits, overload, transient CLI errors)."
+      },
+      "max_scan_agents": {
+        "type": "integer",
+        "default": 24,
+        "minimum": 1,
+        "description": "Upper bound on Stage-0 scan agents; small source files are packed together, and the run stops with a message instead of fanning out further."
+      },
+      "skip_lm": {
+        "type": "boolean",
+        "default": true,
+        "description": "Skip GPT-2 perplexity scoring in style_metrics.py (v2 disables perplexity chasing by default)."
+      },
+      "models": {
+        "type": "object",
+        "description": "Explicit per-stage models (override routing_policy). Leave a stage out (or 'inherit') to let routing_policy decide. Antigravity: native tiers ('inherit', 'pro', 'flash', 'flash_lite') or an agy model id (runs on the agy CLI); CLI backends: a model name for that CLI.",
+        "properties": {
+          "inventory": { "type": "string", "default": "inherit" },
+          "narrative": { "type": "string", "default": "inherit" },
+          "draft": { "type": "string", "default": "inherit" },
+          "figures": { "type": "string", "default": "inherit" },
+          "cross_verify": { "type": "string", "default": "inherit" },
+          "citation_check": { "type": "string", "default": "inherit" },
+          "hygiene": { "type": "string", "default": "inherit" },
+          "compile_fix": { "type": "string", "default": "inherit" },
+          "blind_referee": { "type": "string", "default": "inherit" },
+          "repair": { "type": "string", "default": "inherit" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "required": ["mode", "paper_dir"],
+    "additionalProperties": false
+  }
+}

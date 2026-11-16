@@ -1,0 +1,14 @@
+{
+  "name": "write-paper",
+  "owner": {
+    "name": "write-paper contributors"
+  },
+  "description": "Universal cross-agent LaTeX drafting, PRL/Nature figure geometry checking, citation verification, and blind refereeing skill for physics manuscripts.",
+  "plugins": [
+    {
+      "name": "write-paper",
+      "description": "Theoretical & mathematical physics LaTeX workflow (/write-paper v2)",
+      "source": "./"
+    }
+  ]
+}

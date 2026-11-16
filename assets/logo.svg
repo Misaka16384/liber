@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" fill="none">
+  <!-- Generous >=10% transparent padding; high contrast Okabe-Ito accents on light/dark backgrounds -->
+  <rect x="28" y="28" width="200" height="200" rx="32" fill="#FFFFFF" stroke="#1E293B" stroke-width="6"/>
+  <!-- Sine / dispersion wave motif -->
+  <path d="M52 146 C76 92, 108 92, 128 134 C148 176, 180 176, 204 122" stroke="#0072B2" stroke-width="10" stroke-linecap="round"/>
+  <!-- Closed PRL axes tick frame motif -->
+  <line x1="52" y1="184" x2="204" y2="184" stroke="#1E293B" stroke-width="5" stroke-linecap="round"/>
+  <line x1="52" y1="68" x2="52" y2="184" stroke="#1E293B" stroke-width="5" stroke-linecap="round"/>
+  <!-- Fountain pen nib + geometric vertex -->
+  <path d="M128 52 L162 114 L128 148 L94 114 Z" fill="#D55E00" fill-opacity="0.14" stroke="#D55E00" stroke-width="7" stroke-linejoin="round"/>
+  <line x1="128" y1="52" x2="128" y2="108" stroke="#D55E00" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="128" cy="112" r="7" fill="#D55E00"/>
+</svg>

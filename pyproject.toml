@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "write-paper-skill"
+version = "2.1.0"
+description = "Universal cross-agent LaTeX workflow & deterministic verification suite for theoretical and mathematical physics papers."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = [
+    "pymupdf>=1.24.0",
+    "matplotlib>=3.8.0",
+    "sympy>=1.12",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+lm = ["torch>=2.1.0", "transformers>=4.36.0"]
+
+[tool.setuptools]
+packages = []

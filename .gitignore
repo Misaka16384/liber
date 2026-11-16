@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+.workflow/
+*.aux
+*.bbl
+*.blg
+*.log
+*.pdf
+tmp_*
+.DS_Store
+Thumbs.db
+.wp_backups/
+tests/leak_patterns.local.txt
