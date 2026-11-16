@@ -215,6 +215,10 @@ def test_clean_watermarks_is_safe():
     assert "x -- y  “quoted”" in text and "a%20b" in text and "\\verb|“v”|" in text, "verbatim/url/verb untouched"
     assert "Thus we proceed" in text, "an un-vetted lexicon is never applied"
     assert list((d / ".wp_backups").glob("a.tex.*.bak")), "backup written"
+    (d / "b.tex").write_text("The values of $J$ and $h$ and the gap fix the rank rank of the map.\n", encoding="utf-8")
+    rc, js, _ = tool("clean_watermarks.py", "--paths", d / "b.tex")
+    doubled = [i["match"] for f in js["files"] for i in f["copyedit_issues"] if i["kind"] == "doubled_word"]
+    assert doubled == ["rank rank"], f"words separated by math are not doubled: {doubled}"
     rc, _, _ = tool("clean_watermarks.py", "--paths", d / "missing.tex")
     assert rc == 2
 
@@ -328,7 +332,7 @@ def test_engine_fail_fast_and_edit_guard():
     (p / "sections").mkdir(exist_ok=True)
     for n in ("a", "b", "c"):
         (p / "sections" / f"{n}.tex").write_text(f"orig {n}\n", encoding="utf-8")
-    snap = we.snapshot_project(p, paths["pre_polish"])
+    snap = we.snapshot_project(p, paths["snapshots"] / "guard")
 
     async def rogue(rel):
         (p / rel).write_text("edited\n", encoding="utf-8")
@@ -364,20 +368,40 @@ def test_engine_kills_process_tree():
     assert not alive, "grandchild survived the tree kill"
 
 
-class FakeAgy:
-    """Stand-in for the Antigravity `agent` primitive: records prompts, answers by role."""
+class _FakeCall:
+    """What `agent(...)` returns: awaitable (a one-shot call) and callable (the next turn of a persistent handle)."""
 
-    def __init__(self, hang_roles=(), planner_items=None):
+    def __init__(self, fake, prompt, schema, role, model):
+        self.fake, self.prompt, self.schema, self.role, self.model = fake, prompt, schema, role, model
+
+    def __await__(self):
+        return self.fake._answer(self.prompt, self.schema, self.role, self.model).__await__()
+
+    def __call__(self, prompt, schema=None):
+        return self.fake._answer(prompt, schema, self.role, self.model)
+
+
+class FakeAgy:
+    """Stand-in for the Antigravity `agent` primitive: records prompts, answers by role (prefix match in `answers`)."""
+
+    def __init__(self, hang_roles=(), planner_items=None, answers=None):
         self.calls = []
         self.hang_roles = set(hang_roles)
         self.planner_items = planner_items or []
+        self.answers = answers or {}
 
-    async def __call__(self, prompt, schema=None, role=None, workspace=None, model=None):
+    def __call__(self, prompt, schema=None, role=None, workspace=None, model=None):
+        return _FakeCall(self, prompt, schema, role, model)
+
+    async def _answer(self, prompt, schema, role, model):
         self.calls.append({"role": role, "prompt": prompt, "model": model})
         if role in self.hang_roles:
             await asyncio.sleep(3600)
-        if role == "Plan Surgical Repairs":
+        if role == "Plan Revisions":
             return {"work_items": self.planner_items}
+        for prefix, ans in self.answers.items():
+            if role and role.startswith(prefix):
+                return ans(prompt) if callable(ans) else ans
         return "done"
 
 
@@ -423,7 +447,7 @@ def test_worker_prompts_carry_search_scope_and_task_cleanup():
     assert f"`{notes_parent.resolve()}`" not in prompt, "a file's parent folder must not become search scope"
 
 
-def test_repair_hands_full_instructions_to_workers():
+def test_revise_hands_full_instructions_to_workers():
     p = tmpdir("agy3")
     (p / "sections").mkdir()
     (p / "main.tex").write_text("\\documentclass{article}\\begin{document}\\input{sections/a}\\end{document}\n", encoding="utf-8")
@@ -441,19 +465,19 @@ def test_repair_hands_full_instructions_to_workers():
 
     we.run_build = _no_build
     try:
-        res = asyncio.run(we.run_repair(we.ensure_dirs(p)))
+        res = asyncio.run(we.run_revise(we.ensure_dirs(p)))
         inst = Path(res["instructions"])
         assert inst.exists() and inst.read_bytes() == long_inst.encode("utf-8"), "inline instructions must be saved byte-for-byte"
-        planner = [c for c in fake.calls if c["role"] == "Plan Surgical Repairs"][0]["prompt"]
+        planner = [c for c in fake.calls if c["role"] == "Plan Revisions"][0]["prompt"]
         assert "TRUNCATED" in planner and str(inst) in planner
-        workers = [c for c in fake.calls if c["role"].startswith("Repair:")]
-        assert [c["role"] for c in workers] == ["Repair: main.tex"], "items for one file are merged; items outside paper_dir dropped"
+        workers = [c for c in fake.calls if c["role"].startswith("Revise:")]
+        assert [c["role"] for c in workers] == ["Revise: main.tex"], "items for one file are merged; items outside paper_dir dropped"
         assert str(inst) in workers[0]["prompt"] and "second fix" in workers[0]["prompt"] and "line 1" in workers[0]["prompt"]
 
         fake.calls.clear()
         we._STATE["wf_args"] = {"paper_dir": str(p), "repair_instructions": str(inst), "repair_files": ["sections/a.tex"]}
-        res = asyncio.run(we.run_repair(we.ensure_dirs(p)))
-        assert res["planner_skipped"] and [c["role"] for c in fake.calls] == ["Repair: a.tex"], "single repair file skips the planner"
+        res = asyncio.run(we.run_revise(we.ensure_dirs(p)))
+        assert res["planner_skipped"] and [c["role"] for c in fake.calls] == ["Revise: a.tex"], "single repair file skips the planner"
     finally:
         we._STATE["runtime"] = "cli"
         we.run_tool, we.run_build = orig_tool, orig_build
@@ -703,27 +727,34 @@ def test_agy_turn_nonce_rejects_stale_answers():
     assert we.parse_cli_json("agy", {"status": "SUCCESS", "response": "ok\nTURN NEW1"}, txt, nonce="NEW1")[0] == "ok"
 
 
-def test_verify_round_grouping_and_blockers():
-    p = tmpdir("vround")
+def test_check_issue_collection():
+    p = tmpdir("issues")
     (p / "sections").mkdir()
     (p / "sections" / "sec1.tex").write_text("x\n", encoding="utf-8")
     we = _engine(p)
     reports = [
-        {"auto_fixable": [{"file": str((p / "sections" / "sec1.tex").resolve()), "description": "sign", "exact_fix": "-4"}],
-         "fundamental_blockers": [{"file": str((p / "sections" / "sec1.tex").resolve()), "claim_or_eq": "E = +4", "diagnostic": "sign"}]},
-        {"auto_fixable": [{"file": "sections/sec1.tex", "description": "def", "exact_fix": "define Z"},
-                          {"file": "./sections\\sec1.tex", "description": "dup path", "exact_fix": "..."},
-                          {"file": "../outside.tex", "description": "outside", "exact_fix": "..."}],
-         "fundamental_blockers": [{"file": "sections/sec1.tex", "claim_or_eq": "E  =  +4", "diagnostic": "same"}]},
+        {"issues": [{"file": str((p / "sections" / "sec1.tex").resolve()), "problem": "sign", "quote": "E = +4", "severity": "HIGH"}]},
+        {"issues": [{"file": "./sections\\sec1.tex", "problem": "same", "quote": "E  =  +4", "severity": "high"},
+                    {"file": "sections/sec1.tex", "problem": "vague", "severity": "bogus"},
+                    {"file": "../outside.tex", "problem": "outside", "severity": "low"},
+                    {"file": "sections/sec1.tex", "problem": "", "severity": "low"},
+                    {"file": f"{p.name}/sections/sec1.tex", "problem": "path relative to the agent's cwd", "severity": "low"}]},
     ]
-    by_file, blockers = we.collect_review_round(p, reports)
-    assert list(by_file) == ["sections/sec1.tex"] and len(by_file["sections/sec1.tex"]) == 3, by_file
-    assert len(blockers) == 1 and blockers[0]["file"] == "sections/sec1.tex", "blockers deduplicated across path spellings"
+    issues = we.dedupe_issues(we.collect_issues(p, reports, "scope"))
+    assert [(i["file"], i["severity"]) for i in issues] == [("sections/sec1.tex", "high"), ("sections/sec1.tex", "medium"), ("sections/sec1.tex", "low")], issues
+    assert all(i["source"] == "scope" for i in issues)
+    assert we.resolve_paper_file(p, "/somewhere/else/sections/sec1.tex") is None, "an absolute path outside the paper stays outside"
+    assert we.resolve_paper_file(p, "sections/new.tex") == "sections/new.tex", "a new file inside the paper keeps its path"
     try:
-        we.collect_review_round(p, ["not a dict"])
-        raise AssertionError("non-object reviewer result accepted")
+        we.collect_issues(p, ["not a dict"], "scope")
+        raise AssertionError("non-object checker result accepted")
     except RuntimeError:
         pass
+    det = we.issues_from_defs(p, {"internal_tag_leaks": [{"location": "sections/sec1.tex:3", "match": "Lemma L2"}],
+                                  "abstract_issues": [{"kind": "abstract_too_long", "chars": 700, "limit": 600},
+                                                      {"kind": "abstract_unexpanded_acronym", "acronym": "MBL"}]})
+    assert (det[0]["file"], det[0]["location"], det[0]["severity"]) == ("sections/sec1.tex", "3", "high")
+    assert {d["file"] for d in det[1:]} == {"main.tex"} and "MBL" in det[2]["problem"]
 
 
 def test_entry_refuses_mismatched_engine():
@@ -763,13 +794,13 @@ def test_readonly_attributes_do_not_break_snapshots():
     os.chmod(a, ro)
     os.chmod(p / "refs.bib", ro)
     # a stale snapshot from an earlier run that inherited the read-only bits (the reported failure)
-    old = paths["pre_claim"] / "sections"
+    old = paths["snapshots"] / "pre" / "sections"
     old.mkdir(parents=True)
     (old / "a.tex").write_text("stale\n", encoding="utf-8")
     os.chmod(old / "a.tex", ro)
     os.chmod(old, ro)
     try:
-        snap = we.snapshot_project(p, paths["pre_claim"])  # used to raise PermissionError on Windows
+        snap = we.snapshot_project(p, paths["snapshots"] / "pre")  # used to raise PermissionError on Windows
         assert (snap / "sections" / "a.tex").read_text(encoding="utf-8") == "orig a\n"
         assert not we.is_readonly(snap / "sections" / "a.tex") and not we.is_readonly(snap / "refs.bib"), "snapshot copies must be writable"
         we.write_user_file(a, b"agent edit\n")
@@ -792,8 +823,251 @@ def test_readonly_attributes_do_not_break_snapshots():
             we.clear_readonly(x)
 
 
+# ------------------------------------------------------------------------------------- v3: story first, check afterwards
+
+LONG_STATEMENT = "For every finite-range chain " + "with hypothesis h_k, " * 400 + "the gap closes."
+
+
+def _v3_workspace(name):
+    p = tmpdir(name)
+    wf = p / ".workflow"
+    wf.mkdir(parents=True)
+    (wf / "00_ground_truth_ledger.json").write_text(json.dumps({"claims": [
+        {"id": "THM-1", "statement": LONG_STATEMENT, "tier": "core"},
+        {"id": "NUM-2", "statement": "E0 = -1.2732 for H_7", "tier": "core"},
+        {"id": "AUX-3", "statement": "a support lemma", "tier": "support"},
+    ]}), encoding="utf-8")
+    plan = {"title": "A question about chains", "blocks": [
+        {"id": "question", "part": "main", "file": "sections/s1.tex", "purpose": "the puzzle and its history", "claim_ids": ["THM-1"]},
+        {"id": "result", "part": "main", "file": "sections/s2.tex", "purpose": "the answer", "claim_ids": ["THM-1", "NUM-2"]},
+        {"id": "proof", "part": "sm", "file": "sections/sm1.tex", "purpose": "the proof", "claim_ids": ["AUX-3"]},
+    ], "figures": []}
+    (wf / "01_plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    for n in ("01_story.md", "00_redlines.md", "00_story_material.md"):
+        (wf / n).write_text("x\n", encoding="utf-8")
+    (p / "macros.tex").write_text("\\newcommand{\\Hsym}{H_{\\mathrm{sym}}}\n", encoding="utf-8")
+    return p, plan
+
+
+def test_plan_validation_names_results_by_ledger_id():
+    p, plan = _v3_workspace("plan")
+    we = _engine(p)
+    pp = p / ".workflow" / "01_plan.json"
+    data, err = we.validate_plan(pp, ["THM-1", "NUM-2", "AUX-3"])
+    assert err is None and [b["id"] for b in data["blocks"]] == ["question", "result", "proof"]
+    bad = [
+        ({**plan, "blocks": plan["blocks"] + [{"id": "x", "part": "main", "file": "sections/x.tex", "purpose": "p", "claim_ids": ["THM-99"]}]}, "THM-99"),
+        ({**plan, "blocks": plan["blocks"] + [{"id": "y", "part": "main", "file": "sections/s1.tex", "purpose": "p"}]}, "reuses"),
+        ({**plan, "blocks": [{"id": "z", "part": "main", "file": "../out.tex", "purpose": "p"}]}, "relative"),
+        ({**plan, "blocks": [{"id": "z", "part": "sm", "file": "s.tex", "purpose": "p"}]}, "no main-text"),
+        ({**plan, "blocks": [{"id": "z", "part": "body", "file": "s.tex", "purpose": "p"}]}, "part"),
+    ]
+    for obj, needle in bad:
+        pp.write_text(json.dumps(obj), encoding="utf-8")
+        assert needle in (we.validate_plan(pp, ["THM-1", "NUM-2", "AUX-3"])[1] or ""), needle
+
+
+def test_draft_one_author_writes_blocks_in_order_with_exact_records():
+    p, plan = _v3_workspace("draft")
+    fake = FakeAgy()
+    we = _antigravity_engine(p, fake, genre="letter")
+    try:
+        res = asyncio.run(we.run_draft(we.ensure_dirs(p)))
+    finally:
+        we._STATE["runtime"] = "cli"
+    author = [c for c in fake.calls if c["role"] == "Author"]
+    assert len(author) == 4, [c["role"] for c in fake.calls]
+    assert "Block 1/2 `question`" in author[0]["prompt"] and "This is the opening block." in author[0]["prompt"]
+    assert "Block 2/2 `result`" in author[1]["prompt"] and "sections/s1.tex" in author[1]["prompt"].replace("\\", "/")
+    assert "abstract" in author[2]["prompt"] and "600 characters" in author[2]["prompt"]
+    assert "Read the whole main text" in author[3]["prompt"]
+    assert LONG_STATEMENT in author[0]["prompt"], "ledger records are joined in full, never truncated or paraphrased"
+    assert "E0 = -1.2732 for H_7" in author[1]["prompt"] and "E0 = -1.2732" not in author[0]["prompt"]
+    sm = [c for c in fake.calls if c["role"] == "SM proof"]
+    assert len(sm) == 1 and "Rigour first" in sm[0]["prompt"] and "a support lemma" in sm[0]["prompt"]
+    main = (p / "main.tex").read_text(encoding="utf-8")
+    assert main.index("\\input{sections/s1.tex}") < main.index("\\input{sections/s2.tex}") and "aps,prl" in main
+    assert "\\input{sections/sm1.tex}" in (p / "supplement.tex").read_text(encoding="utf-8")
+    assert res["main_blocks"] == 2 and res["sm_blocks"] == 1
+    assert (p / ".workflow" / "refs" / "genre_templates.md").exists(), "reference notes are copied for the agents to read"
+
+
+def test_check_reports_only_and_writes_issue_file():
+    p, plan = _v3_workspace("check")
+    (p / "sections").mkdir()
+    for f in ("s1", "s2", "sm1"):
+        (p / "sections" / f"{f}.tex").write_text(f"text of {f}\n", encoding="utf-8")
+    (p / "main.tex").write_text("\\begin{document}\\begin{abstract}A.\\end{abstract}\\input{sections/s1}\\input{sections/s2}\\end{document}\n", encoding="utf-8")
+
+    def vandal_check(prompt):
+        (p / "sections" / "s1.tex").write_text("REWRITTEN BY A CHECKER\n", encoding="utf-8")
+        return {"issues": [{"file": "sections/s1.tex", "location": "1", "quote": "text of s1", "problem": "overclaims THM-1", "severity": "high"}]}
+
+    fake = FakeAgy(answers={"Check s1.tex": vandal_check, "Check": {"issues": []}, "Numeric": {"issues": []},
+                            "Reader Check": {"issues": [{"file": "main.tex", "problem": "the introduction never says why it matters", "severity": "medium"}]}})
+    we = _antigravity_engine(p, fake, genre="letter")
+    orig_tool = we.run_tool
+
+    def fake_tool(name, cli, allow_fail=True, timeout_s=1800):
+        if name == "verify_citations.py":
+            return 0, "", "", {"entries": [], "todo_placeholders": []}
+        if name == "audit_tex_defs.py":
+            assert "--abstract-max-chars" in cli and "600" in cli, "letters get the 600-character check"
+            return 1, "", "", {"abstract_issues": [{"kind": "abstract_unexpanded_acronym", "acronym": "MBL"}], "abstract_math": ["\\eta"]}
+        return 0, "", "", {}
+
+    we.run_tool = fake_tool
+    try:
+        res = asyncio.run(we.run_check(we.ensure_dirs(p)))
+    finally:
+        we.run_tool = orig_tool
+        we._STATE["runtime"] = "cli"
+    assert (p / "sections" / "s1.tex").read_text(encoding="utf-8") == "text of s1\n", "checkers cannot change the manuscript"
+    data = json.loads((p / ".workflow" / "03_issues.json").read_text(encoding="utf-8"))
+    problems = [i["problem"] for i in data["issues"]]
+    assert data["issues"][0]["severity"] == "high" and "overclaims THM-1" in problems
+    assert any("MBL" in x for x in problems) and any("why it matters" in x for x in problems)
+    assert res["high"] == 1 and (p / "audit_reports" / "01_check_report.md").exists()
+    numeric = [c["role"] for c in fake.calls if c["role"].startswith("Numeric")]
+    assert sorted(numeric) == ["Numeric NUM-2", "Numeric THM-1"], "scripted checks go to core results, not the first N"
+    reader = [c for c in fake.calls if c["role"] == "Reader Check"][0]["prompt"]
+    assert "\\eta" in reader and "what is new here" in reader
+    checker = [c for c in fake.calls if c["role"] == "Check s2.tex"][0]["prompt"]
+    assert "Do not use `01_story.md`" in checker and "Report nothing about style" in checker
+
+
+def test_revise_works_from_issues_in_reading_order():
+    p, plan = _v3_workspace("revise")
+    (p / "sections").mkdir()
+    for f in ("s1", "s2", "sm1"):
+        (p / "sections" / f"{f}.tex").write_text(f"text of {f}\n", encoding="utf-8")
+    (p / "main.tex").write_text("\\input{sections/s1} % \\input{sections/old}\n\\input{sections/s2}\n", encoding="utf-8")
+    issues = [{"file": f, "problem": f"fix {f}", "severity": "medium"} for f in ("main.tex", "sections/s2.tex", "sections/sm1.tex", "sections/s1.tex")]
+    issues.append({"file": f"{p.name}/sections/s2.tex", "problem": "same file, spelled from the agent's cwd", "severity": "low"})
+    (p / ".workflow" / "03_issues.json").write_text(json.dumps({"issues": issues}), encoding="utf-8")
+    fake = FakeAgy(answers={"Revise": {"fixed": ["done"], "declined": []}})
+    we = _antigravity_engine(p, fake, genre="letter")
+    try:
+        res = asyncio.run(we.run_revise(we.ensure_dirs(p), build_after=False))
+    finally:
+        we._STATE["runtime"] = "cli"
+    assert [c["role"] for c in fake.calls] == ["Revise: sm1.tex", "Revise: s1.tex", "Revise: s2.tex", "Revise: main.tex"], \
+        "SM first, then the main text in reading order with the abstract (main.tex) last; one work item per file"
+    assert "never by adding qualifiers" in fake.calls[1]["prompt"] and "600 characters" in fake.calls[1]["prompt"]
+    assert "fix sections/s1.tex" in fake.calls[1]["prompt"] and "spelled from the agent's cwd" in fake.calls[2]["prompt"]
+    assert res["instructions"].endswith("03_issues.json") and (p / "audit_reports" / "06_revise_report.md").exists()
+    assert we.main_part_files(p) == ["sections/s1.tex", "sections/s2.tex", "main.tex"], "commented-out inputs are ignored"
+
+
+def test_cross_vendor_check_routing_and_legacy_stage_models():
+    p = tmpdir("xv")
+    fake = FakeAgy()
+    we = _antigravity_engine(p, fake, check_backend="claude")
+    we._STATE["check_backend"] = "claude"
+    try:
+        r = we.route_call("check", "heavy")
+        assert (r.kind, r.backend, r.model) == ("cli", "claude", "opus") and "cross-vendor" in r.reason
+        assert we.route_call("draft", "heavy").kind == "native", "only the check stage moves"
+        we._STATE["models_cfg"] = {"cross_verify": "sonnet", "narrative": "pro"}
+        assert we.explicit_stage_model("check") == "sonnet" and we.explicit_stage_model("story") == "pro"
+    finally:
+        we._STATE.update({"runtime": "cli", "check_backend": "", "models_cfg": {}})
+    we._STATE.update({"backend": "agy", "check_backend": "claude"})
+    orig = we._find_cli_binary
+    we._find_cli_binary = lambda name: name
+    try:
+        assert we.resolve_cli_backend("check")[0] == "claude" and we.resolve_cli_backend("draft")[0] == "agy"
+    finally:
+        we._find_cli_binary = orig
+        we._STATE.update({"backend": "claude", "check_backend": ""})
+
+
+def test_lineage_references_are_verified_by_the_workflow():
+    p = tmpdir("lineage")
+    we = _engine(p)
+    seed = p / "seed.bib"
+    seed.write_text("@article{Old2000,\n  title={Old}\n}\n", encoding="utf-8")
+    steps = [{"who": "Kramers and Wannier", "question": "q", "found": "f", "doi": "10.1103/PhysRev.60.252", "title": "Statistics of the 2D ferromagnet"},
+             {"who": "Made up", "question": "q", "found": "f", "doi": "10.0000/fake", "title": "Fake"},
+             {"who": "Old", "question": "q", "found": "f", "arxiv": "0001.0001", "title": "Old"},
+             {"who": "No id", "question": "q", "found": "f"}]
+    calls = []
+
+    def fake_tool(name, cli, allow_fail=True, timeout_s=1800):
+        calls.append(cli)
+        ident = cli[2]
+        if ident == "10.1103/PhysRev.60.252":
+            return 0, "", "", {"verified": True, "bibtex": "@article{Kramers1941,\n  title={Statistics}\n}"}
+        if ident == "0001.0001":
+            return 0, "", "", {"verified": True, "bibtex": "@article{Old2000,\n  title={Old}\n}"}
+        return 1, "", "", {"verified": False, "bibtex": ""}
+
+    orig = we.run_tool
+    we.run_tool = fake_tool
+    try:
+        added = we.verify_lineage_refs(steps, seed, p / "cache.json")
+    finally:
+        we.run_tool = orig
+    text = seed.read_text(encoding="utf-8")
+    assert added == 1 and "Kramers1941" in text and text.count("Old2000") == 1
+    assert [s["verified"] for s in steps] == [True, False, True, False] and len(calls) == 3
+    assert all("--title" in c for c in calls), "an identifier only counts when its title matches"
+    md = we.render_lineage(steps, "this paper")
+    assert "[verified: Kramers1941]" in md and "[unverified: 10.0000/fake]" in md
+
+
+def test_abstract_is_checked_as_a_standalone_text():
+    a = tmpdir("abs")
+    long_tail = " The construction is explicit and the numerics agree." * 12
+    (a / "main.tex").write_text(
+        "\\documentclass[aps,prl]{revtex4-2}\n\\begin{document}\n\\begin{abstract}\n"
+        "We classify palindromic MBL symmetries of Kramers--Wannier (KW) self-dual chains with symmetry-protected "
+        "topological (SPT) order, using $\\eta$ and MPS methods." + long_tail + "\n\\end{abstract}\nBody.\n\\end{document}\n", encoding="utf-8")
+    rc, js, err = tool("audit_tex_defs.py", "--main", a / "main.tex", "--abstract-max-chars", "600")
+    assert js is not None, err
+    kinds = {(i["kind"], i.get("acronym")) for i in js["abstract_issues"]}
+    assert ("abstract_unexpanded_acronym", "MBL") in kinds and ("abstract_unexpanded_acronym", "MPS") in kinds
+    assert not any(k[1] in ("KW", "SPT") for k in kinds), "acronyms expanded inside the abstract are fine"
+    assert ("abstract_too_long", None) in kinds and js["abstract_chars_est"] > 600 and js["abstract_math"] == ["\\eta"]
+    assert rc == 1 and not js["checks"]["abstract_reads_alone"]
+
+
+
+def test_build_fixer_never_makes_figures():
+    p = tmpdir("buildfig")
+    (p / "main.tex").write_text("x\n", encoding="utf-8")
+
+    def fixer(prompt):
+        (p / "figures" / "fig_gap.pdf").write_bytes(b"%PDF-1.4 made up by the fixer")
+        return "fixed the $ error and drew the missing figure"
+
+    fake = FakeAgy(answers={"Build/Layout Fix": fixer})
+    we = _antigravity_engine(p, fake)
+    missing_err = "./sections/r.tex:3: LaTeX Error: File `figures/fig_gap' not found."
+    builds = [[missing_err, "./sections/r.tex:4: Missing $ inserted."], [missing_err], [missing_err]]
+    orig_tool = we.run_tool
+
+    def fake_tool(name, cli, allow_fail=True, timeout_s=1800):
+        if name == "build_and_flatten_tex.py":
+            errs = builds.pop(0)
+            return 1, "", "", {"compile_result": {"clean_pass": False, "latex_errors": errs}, "layout_check": {}}
+        return 0, "", "", {}
+
+    we.run_tool = fake_tool
+    try:
+        res = asyncio.run(we.run_build(we.ensure_dirs(p)))
+    finally:
+        we.run_tool = orig_tool
+        we._STATE["runtime"] = "cli"
+    fixes = [c for c in fake.calls if c["role"].startswith("Build/Layout Fix")]
+    assert len(fixes) == 1 and "Never create, regenerate or edit figure files" in fixes[0]["prompt"], "one fix for the $ error, none for the missing figure"
+    assert len(builds) == 1, "a build whose only problem is a missing figure is not retried"
+    assert not (p / "figures" / "fig_gap.pdf").exists() and list((p / ".workflow" / "readonly_violations").glob("*fig_gap.pdf"))
+    assert res["missing_files"] == ["figures/fig_gap"] and res["clean"] is False
+
+
 def main() -> int:
-    tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
+    tests =[(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
     for name, fn in tests:
         t0 = time.time()

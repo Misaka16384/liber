@@ -13,7 +13,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-ENTRY_VERSION = "2.1.0"
+ENTRY_VERSION = "3.0.0"
 
 
 def _resolve_scripts_dir() -> Path:

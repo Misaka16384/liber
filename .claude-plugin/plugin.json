@@ -1,7 +1,7 @@
 {
   "name": "liber",
   "description": "Liber: the /write-paper skill, a modular, re-entrant theoretical & mathematical physics LaTeX paper workflow with PyMuPDF figure verification, dual DOI/arXiv/.bbl citation audit, quantifier lock, and cross-vendor blind refereeing.",
-  "version": "2.1.0",
+  "version": "3.0.0",
   "author": {
     "name": "liber contributors"
   },

@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Universal, dual-mode modular orchestrator for /write-paper (v2).
+"""Universal, dual-mode modular orchestrator for /write-paper (v3: story first, check afterwards).
 
-Runs seamlessly inside:
+Runs inside:
 1. Antigravity `run_workflow` (via `paper_workflow.py` -> `run_from_antigravity(globals())`)
 2. Standalone Python CLI across Claude Code (`claude`), Antigravity CLI (`agy`),
    or OpenAI Codex CLI (`codex`) (via `run_paper.py` -> `run_from_cli(args_dict)`).
 
-Supports all 10 on-demand atomic phases (`inventory`, `blueprint`, `draft`, `figures`,
-`verify`, `citations`, `hygiene`, `build`, `blind_referee`, `repair`) plus composite
-pipelines (`draft_and_audit`, `audit_polish`, `full_auto`, `smoke_test`).
+Phases: `inventory` (material pack), `story` (lineage, story, block plan), `draft` (one author writes the
+main text block by block), `figures`, `check` (report only), `revise` (the author fixes the reported issues),
+`cleanup`, `build`, `blind_referee`; pipelines `draft_and_check`, `check_and_revise`, `full_auto`, `smoke_test`.
+v2 mode names still work (blueprint, verify, citations, hygiene, repair, draft_and_audit, audit_polish).
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
-ENGINE_VERSION = "2.1.0"
+ENGINE_VERSION = "3.0.0"
 SKILL_DIR = Path(__file__).resolve().parent.parent
 TOOLS_DIR = SKILL_DIR / "scripts" / "tools"
 REFS_DIR = SKILL_DIR / "references"
@@ -97,6 +98,7 @@ _STATE: Dict[str, Any] = {
     "runtime": "cli",            # "antigravity" | "cli"
     "backend": "auto",           # "auto" | "claude" | "agy" | "codex"
     "referee_backend": "",       # optional cross-vendor backend for blind_referee
+    "check_backend": "",         # optional cross-vendor backend for the check stage
     "wf_args": {},
     "models_cfg": {},
     "batch_size": 4,
@@ -198,12 +200,15 @@ def _find_cli_binary(backend: str) -> Optional[str]:
     return None
 
 
+def stage_backend_override(stage_name: str) -> str:
+    """A different vendor for checking or refereeing (e.g. Gemini writes, Claude checks); "" = no override."""
+    key = {"blind_referee": "referee_backend", "check": "check_backend"}.get(stage_name)
+    return str(_STATE.get(key) or "").lower() if key else ""
+
+
 def resolve_cli_backend(stage_name: str = "") -> Tuple[str, str]:
     """Select active CLI backend and binary path ('claude', 'agy', or 'codex')."""
-    if stage_name == "blind_referee" and _STATE.get("referee_backend"):
-        req = str(_STATE["referee_backend"]).lower()
-    else:
-        req = str(_STATE.get("backend") or "auto").lower()
+    req = stage_backend_override(stage_name) or str(_STATE.get("backend") or "auto").lower()
 
     if req != "auto":
         bin_p = _find_cli_binary(req)
@@ -571,15 +576,16 @@ def resolve_native_model(stage_name: str) -> str:
 #
 # Every agent call site declares how much reasoning it needs (independent of whether it may write files,
 # which is the separate `read_only` flag):
-#   heavy   - deep reading / auditing / planning (source scans, reverse blueprint audit, 3A/3C reviewers,
-#             blind referees, repair planner)
-#   builder - multi-step authoring that writes files (ledger synthesis, blueprint, drafting, figures,
-#             SymPy scripts, citation and repair edits)
-#   fast    - short mechanical fixes (copy-edit, compile fix, JSON repair)
+#   heavy   - deep reading / judging / planning (source scans, lineage, story and plan, checkers, the
+#             reader check, blind referees, revision planner)
+#   builder - multi-step authoring that writes files (material synthesis, the author, SM blocks, figures,
+#             scripted numeric checks, revisions, citation fixes)
+#   fast    - short mechanical fixes (compile fix, JSON repair)
 #   probe   - connectivity pings
 #
 # Precedence: an explicit per-stage model in `models` > routing_policy. Under `uniform_inherit` every call
-# uses the host/CLI default, as before tiering existed.
+# uses the host/CLI default, as before tiering existed. `check_backend` / `referee_backend` send those stages
+# to another vendor's CLI in both runtimes.
 TASK_TIERS = ("heavy", "builder", "fast", "probe")
 ROUTING_POLICIES = ("auto_tiered", "uniform_inherit")
 
@@ -684,11 +690,31 @@ def _agy_models() -> Optional[List[str]]:
 _UNSET = object()
 
 
+_LEGACY_STAGE_NAMES = {"story": ("narrative",), "check": ("cross_verify", "citation_check"), "revise": ("repair",)}
+
+
+def explicit_stage_model(stage_name: str) -> str:
+    """`models[stage]`, also under its v2 name (narrative, cross_verify, citation_check, repair)."""
+    cfg = _STATE.get("models_cfg") or {}
+    for key in (stage_name, *_LEGACY_STAGE_NAMES.get(stage_name, ())):
+        val = str(cfg.get(key) or "").strip()
+        if val:
+            return val
+    return ""
+
+
 def route_call(stage_name: str, tier: str) -> Route:
     runtime = _STATE["runtime"]
-    explicit = str((_STATE["models_cfg"] or {}).get(stage_name) or "")
+    explicit = explicit_stage_model(stage_name)
     policy = str(_STATE.get("routing_policy") or "auto_tiered")
     in_plan = _STATE.get("in_plan_mode")
+    override = stage_backend_override(stage_name)
+    if override and runtime == "antigravity":
+        # Cross-vendor stage from inside Antigravity: a standalone CLI of the other vendor.
+        model = "" if explicit in NATIVE_MODEL_TIERS else explicit
+        route = decide_route(runtime="cli", cli_backend=override, tier=tier, explicit_model=model, policy=policy, in_plan_mode=None,
+                             agy_available=False, agy_models=_agy_models() if override == "agy" else None)
+        return Route(route.kind, route.backend, route.model, f"{stage_name} on {override} (cross-vendor); {route.reason}")
     cli_backend = ""
     agy_available = False
     if runtime == "antigravity":
@@ -769,7 +795,10 @@ async def dispatch_agent(
         _readonly_restore(snap, role)
 
 
-_READONLY_WF_FILES = ("00_locks.json", "00_ground_truth_ledger.json", "00_style_profile.json", "01_blueprint.json")
+_READONLY_WF_FILES = (
+    "00_ground_truth_ledger.json", "00_redlines.md", "00_story_material.md", "00_style_profile.json",
+    "01_lineage.md", "01_story.md", "01_plan.json", "00_locks.json", "01_blueprint.json",
+)
 
 
 def _readonly_snapshot() -> Optional[Dict[str, Any]]:
@@ -994,10 +1023,11 @@ async def run_guarded_edit_batches(
     snapshot_dir: Path,
     rel_files: List[str],
     worker: Callable[[str], Any],
+    batch_size: Optional[int] = None,
 ) -> List[Any]:
-    """Run per-file edit agents in batches; afterwards restore any file an agent touched that was not
-    one of that batch's targets (agents get write access to the whole directory)."""
-    bsize = max(1, int(_STATE["batch_size"] or 4))
+    """Run per-file edit agents in batches (batch_size=1: one file at a time, in order); afterwards restore any
+    file an agent touched that was not one of that batch's targets (agents get write access to the whole directory)."""
+    bsize = max(1, int(batch_size or _STATE["batch_size"] or 4))
     results: List[Any] = []
     for i in range(0, len(rel_files), bsize):
         chunk = rel_files[i : i + bsize]
@@ -1046,8 +1076,7 @@ def ensure_dirs(paper_dir: Path) -> Dict[str, Path]:
         "wf": paper_dir / ".workflow",
         "raw_drafts": paper_dir / ".workflow" / "02_raw_drafts",
         "verify_scripts": paper_dir / ".workflow" / "verify_scripts",
-        "pre_claim": paper_dir / ".workflow" / "04_pre_claim",
-        "pre_polish": paper_dir / ".workflow" / "05_pre_polish",
+        "refs": paper_dir / ".workflow" / "refs",
         "fig_scripts": paper_dir / ".workflow" / "figures",
         "fig_renders": paper_dir / ".workflow" / "figures" / "renders",
         "snapshots": paper_dir / ".workflow" / "snapshots",
@@ -1313,8 +1342,174 @@ async def _edit_with_math_lock_retry(
 
 
 # ==============================================================================
-# Stage 0: Ground-Truth Ledger, Hard Locks & Vetted Exemplar Profile
+# v3 pipeline
+#   inventory (material pack) -> story (lineage, story, block plan; full_auto pauses here for the author)
+#   -> draft (one author writes the main text block by block; SM blocks in parallel)
+#   -> check (report only) -> revise (the author fixes) -> check -> build (deterministic clean-up + compile)
+# Writers get material and the story, not rule lists. Whatever a program can check (length limits, acronyms
+# in the abstract, heading breaks, leaks, word budget) is checked after writing instead of being demanded up front.
 # ==============================================================================
+
+ABSTRACT_LIMITS = {"letter": 600}  # rendered characters including spaces (APS Letters); long papers: no hard limit
+SEVERITIES = ("high", "medium", "low")
+MODE_ALIASES = {
+    "blueprint": "story",
+    "verify": "check",
+    "citations": "check",
+    "hygiene": "cleanup",
+    "repair": "revise",
+    "draft_and_audit": "draft_and_check",
+    "audit_polish": "check_and_revise",
+}
+
+
+def stage_refs(paths: Dict[str, Path]) -> Dict[str, Path]:
+    """Copy the reference notes into .workflow/refs/ and return their paths.
+
+    Agents get these paths and read the files themselves. CLI workers may be refused reads outside the paper
+    directory, and the v2 habit of inlining excerpts cut at a fixed length silently dropped most of each file.
+    """
+    out: Dict[str, Path] = {}
+    for name in ("genre_templates.md", "figure_visual_language.md"):
+        src = REFS_DIR / name
+        if src.exists():
+            dst = paths["wf"] / "refs" / name
+            copy_to_workflow(src, dst)
+            out[name] = dst
+    return out
+
+
+def _ledger_claims(ledger_path: Path) -> List[Dict[str, Any]]:
+    """The ledger is agent-written: accept {"claims": [...]}, close variants, or a bare list."""
+    try:
+        data = json.loads(read_text_safe(ledger_path) or "null")
+    except json.JSONDecodeError as exc:
+        log(f"[ledger] {ledger_path} is not valid JSON ({exc.msg} at line {exc.lineno})")
+        return []
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        items = next((data[k] for k in ("claims", "verified_claims", "ledger", "entries", "items") if isinstance(data.get(k), list)), [])
+    else:
+        items = []
+    out: List[Dict[str, Any]] = []
+    for i, it in enumerate(items):
+        out.append(it if isinstance(it, dict) else {"id": f"C{i + 1}", "summary": str(it)})
+    return out
+
+
+def _ledger_index(ledger_path: Path) -> Dict[str, Dict[str, Any]]:
+    return {str(c["id"]): c for c in _ledger_claims(ledger_path) if c.get("id") is not None}
+
+
+def ledger_records(index: Dict[str, Dict[str, Any]], ids: Sequence[Any]) -> str:
+    """The exact ledger records a block needs, joined by the program: the plan only names their ids, so no
+    agent ever works from a paraphrase of a result (v2's blueprint paraphrases were the main error source)."""
+    recs = [index[str(i)] for i in ids if str(i) in index]
+    return json.dumps(recs, indent=1, ensure_ascii=False) if recs else "(none assigned)"
+
+
+def _plan_path() -> Path:
+    args = _wf_args()
+    return Path(str(args.get("plan_path") or (Path(str(args["paper_dir"])) / ".workflow" / "01_plan.json")))
+
+
+def validate_plan(plan_path: Path, known_ids: Optional[Sequence[str]] = None) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Parse 01_plan.json. Blocks name results only by ledger id; ids missing from the ledger are an error."""
+    if not plan_path.exists():
+        return None, f"{plan_path} does not exist (run mode=story first)"
+    try:
+        data = json.loads(read_text_safe(plan_path))
+    except json.JSONDecodeError as exc:
+        return None, f"invalid JSON at line {exc.lineno} col {exc.colno}: {exc.msg}"
+    if not isinstance(data, dict):
+        return None, "top level must be a JSON object"
+    blocks = data.get("blocks")
+    if not isinstance(blocks, list) or not blocks:
+        return None, "`blocks` must be a non-empty list"
+    known = {str(k) for k in known_ids} if known_ids else None
+    ids: set = set()
+    files: set = set()
+    unknown: List[str] = []
+    for i, b in enumerate(blocks):
+        if not isinstance(b, dict):
+            return None, f"blocks[{i}] is not an object"
+        bid = str(b.get("id") or "").strip()
+        f = str(b.get("file") or "").strip().replace("\\", "/")
+        if not bid or bid in ids:
+            return None, f"blocks[{i}] needs a unique `id`"
+        if b.get("part") not in ("main", "sm"):
+            return None, f'blocks[{i}] `part` must be "main" or "sm"'
+        if not f.endswith(".tex") or f.startswith("/") or ":" in f or ".." in f.split("/"):
+            return None, f"blocks[{i}] `file` must be a relative .tex path inside the paper directory"
+        if f in files:
+            return None, f"blocks[{i}] reuses the file {f}"
+        if not str(b.get("purpose") or "").strip():
+            return None, f"blocks[{i}] has no `purpose`"
+        cids = b.get("claim_ids") or []
+        if not isinstance(cids, list):
+            return None, f"blocks[{i}] `claim_ids` must be a list"
+        if known is not None:
+            unknown += [str(c) for c in cids if str(c) not in known]
+        ids.add(bid)
+        files.add(f)
+        b["file"] = f
+    if not any(b.get("part") == "main" for b in blocks):
+        return None, "the plan has no main-text block"
+    if unknown:
+        return None, f"claim_ids not in the ledger: {sorted(set(unknown))[:20]}"
+    figs = data.get("figures") or []
+    if not isinstance(figs, list) or not all(isinstance(x, dict) and str(x.get("id") or "").strip() for x in figs):
+        return None, "`figures` must be a list of objects with an `id`"
+    return data, None
+
+
+def validate_blueprint(bp_path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """A v2 `01_blueprint.json`; v3 reads it only for the figure list of old workspaces."""
+    if not bp_path.exists():
+        return None, f"{bp_path} does not exist"
+    try:
+        data = json.loads(read_text_safe(bp_path))
+    except json.JSONDecodeError as exc:
+        return None, f"invalid JSON at line {exc.lineno} col {exc.colno}: {exc.msg}"
+    if not isinstance(data, dict):
+        return None, "top level must be a JSON object"
+    sections = data.get("sections")
+    if not isinstance(sections, list) or not sections:
+        return None, "`sections` must be a non-empty list"
+    for idx, sec in enumerate(sections):
+        if not isinstance(sec, dict):
+            return None, f"sections[{idx}] is not an object"
+        if not str(sec.get("file") or "").strip():
+            return None, f"sections[{idx}] has no `file`"
+    return data, None
+
+
+async def _ensure_valid_plan(plan_path: Path, ledger_path: Path) -> Dict[str, Any]:
+    known = list(_ledger_index(ledger_path))
+    data, err = validate_plan(plan_path, known)
+    if err is None and data is not None:
+        return data
+    if not plan_path.exists():
+        raise RuntimeError(err)
+    log(f"[plan] invalid: {err}; asking for a repair")
+    await dispatch_agent(
+        f"`{plan_path}` fails validation: {err}. Fix it in place: strict JSON; every block needs a unique `id`, `part` \"main\" or \"sm\", "
+        f"a unique relative `file` ending in .tex, a one-sentence `purpose`, and `claim_ids` that exist in `{ledger_path}`. Change nothing else.",
+        schema={"type": "string"},
+        role="Plan JSON Repair",
+        stage_name="story",
+        tier="fast",
+    )
+    data, err = validate_plan(plan_path, known)
+    if err is not None or data is None:
+        raise RuntimeError(f"01_plan.json is still invalid after repair: {err}")
+    return data
+
+
+# ------------------------------------------------------------------------------
+# Stage 0: material pack
+# ------------------------------------------------------------------------------
 
 async def run_inventory(paths: Dict[str, Path]) -> Dict[str, Any]:
     wf = paths["wf"]
@@ -1339,26 +1534,22 @@ async def run_inventory(paths: Dict[str, Path]) -> Dict[str, Any]:
             f"needed), or raise --max-scan-agents deliberately."
         )
 
-    phase("Stage 0: Ground-Truth Ledger, Structural Locks & Exemplar Vetting")
+    phase("Stage 0: Material Pack (results ledger, red lines, story material, voice samples)")
     profile_path = wf / "00_style_profile.json"
     if exemplar_paths:
         rc, _, _, _ = run_tool("style_metrics.py", ["profile", "--inputs", *exemplar_paths, "--out", str(profile_path), "--no-lm"], allow_fail=True)
         log(f"style_metrics.py profile exited {rc}")
     ensure_default_profile(paths)
-
     if exemplar_paths:
         vet_res = await dispatch_agent(
-            f"Inspect `{profile_path}` and exemplar files {exemplar_paths}.\n"
-            f"Task A — Curate 4 to 6 clean verbatim Few-Shot paragraphs covering roles (`opening_hook`, `setup_definition`, "
-            f"`theorem_commentary`, `derivation_mechanism`, `discussion`) inside `categorized_exemplars` & `exemplar_paragraphs`.\n"
-            f"Task B — LEXICON SAFETY VETTING (CRITICAL): Review `preferred_lexicon.candidate_connector_swaps` and `evaluative_hype_counts` in `{profile_path}`.\n"
-            f"Verify that ZERO words carrying scientific, mathematical, logical, or quantifier meaning (`fixing`, `preserves`, `admits`, `realizes`, `for all`, `exists`, `irreducible`, `multiplicity`, etc.) enter replacements.\n"
-            f"Write ONLY vetted pure non-scientific connectors/rhetorical swaps into `preferred_lexicon.vetted_replacements`, optional hype warnings into `vetted_style_hints`, and set `preferred_lexicon.lexicon_vetted = true` inside `{profile_path}`.",
-            schema={"type": "object", "properties": {"curated_count": {"type": "integer"}, "approved_swaps": {"type": "array", "items": {"type": "string"}}, "rejected_words": {"type": "array", "items": {"type": "string"}}}, "required": ["curated_count", "approved_swaps"]},
-            role="Curate Few-Shot & Vet Lexicon",
+            f"Read the exemplar papers {exemplar_paths}. Copy verbatim 5 to 8 paragraphs worth imitating into `{profile_path}`, under "
+            f"`categorized_exemplars`: an object with the keys `opening`, `history`, `result_statement`, `mechanism` and `discussion`, each a "
+            f"list of paragraphs (leave a list empty when the papers have no good example). Leave the other keys of the file as they are.",
+            schema={"type": "object", "properties": {"curated_count": {"type": "integer"}}, "required": ["curated_count"]},
+            role="Curate Voice Samples",
             stage_name="inventory",
         )
-        log(f"Exemplar vetting completed: {vet_res}")
+        log(f"Voice samples curated: {vet_res}")
 
     scan_schema = {
         "type": "object",
@@ -1366,8 +1557,9 @@ async def run_inventory(paths: Dict[str, Path]) -> Dict[str, Any]:
             "file": {"type": "string"},
             "is_authority": {"type": "boolean"},
             "claims": {"type": "array", "items": {"type": "object"}},
-            "redlines_and_decisions": {"type": "array", "items": {"type": "string"}},
             "locked_numbers": {"type": "array", "items": {"type": "object"}},
+            "redlines_and_decisions": {"type": "array", "items": {"type": "string"}},
+            "story_material": {"type": "array", "items": {"type": "string"}},
             "notations": {"type": "array", "items": {"type": "string"}},
             "domain_terms": {"type": "array", "items": {"type": "string"}},
             "cited_works": {"type": "array", "items": {"type": "string"}},
@@ -1379,11 +1571,13 @@ async def run_inventory(paths: Dict[str, Path]) -> Dict[str, Any]:
         scan_jobs,
         lambda job: dispatch_agent(
             f"Read each of these files thoroughly (authority_doc={job[1]}): {[str(p) for p in job[0]]}.\n"
-            f"Return one record per file. For each file extract:\n"
-            f"1. All theorems/lemmas/propositions with exact hypotheses, quantifiers (`with multiplicity`, translation invariance, finite range, boundary conditions), and line spans.\n"
-            f"2. User-decided redlines, prohibited claims, verification status grades, and mandatory inclusions.\n"
-            f"3. Exact numerical values paired with the EXACT physical Hamiltonian/observable/residual they belong to (never conflate bounds or models).\n"
-            f"4. Notations, domain physics terms, and prior papers cited.",
+            f"Return one record per file with:\n"
+            f"1. `claims`: every result (theorem, lemma, proposition, numerical finding) with its exact statement, its hypotheses and quantifiers "
+            f"(`with multiplicity`, translation invariance, finite range, boundary conditions) and its line span.\n"
+            f"2. `locked_numbers`: exact values, each with the exact Hamiltonian / observable / residual it belongs to (never conflate bounds or models).\n"
+            f"3. `redlines_and_decisions`: the author's decisions and prohibitions (what must not be claimed or mentioned), verbatim.\n"
+            f"4. `story_material`: why the author cared, physical pictures and analogies, surprises, history and prior work mentioned, open questions (with line spans).\n"
+            f"5. `notations`, `domain_terms`, `cited_works`.",
             schema=scan_list_schema,
             role=f"Scan {job[0][0].name}" + (f" (+{len(job[0]) - 1})" if len(job[0]) > 1 else ""),
             stage_name="inventory",
@@ -1398,53 +1592,123 @@ async def run_inventory(paths: Dict[str, Path]) -> Dict[str, Any]:
     scans_path.write_text(json.dumps(scans, indent=2, ensure_ascii=False), encoding="utf-8")
 
     ledger_path = wf / "00_ground_truth_ledger.json"
-    locks_path = wf / "00_locks.json"
+    redlines_path = wf / "00_redlines.md"
+    story_path = wf / "00_story_material.md"
     conflicts_path = wf / "00_conflicts_report.md"
     synth_res = await dispatch_agent(
-        f"Synthesize all scanned records in `{scans_path}` ({len(scans)} records; read the whole file) into THREE canonical files:\n"
-        f"1. `{ledger_path}`: complete verified claims ledger (IDs, hypotheses, equations, scripts, provenance).\n"
-        f"2. `{locks_path}`: immutable machine-readable lock table with keys:\n"
-        f"   - `redlines_and_decisions`: list of mandatory user rules & prohibitions (keep exact wording).\n"
-        f"   - `locked_numbers`: list of {{id, value, exact_object, allowed_qualifier, forbidden_qualifier, source}}.\n"
-        f"   - `locked_theorems`: list of {{id, statement_hypotheses, mandatory_quantifiers, status_grade}}.\n"
-        f"   - `sympy_verify_targets`: list of claims needing SymPy/numerical script checks.\n"
-        f"3. `{conflicts_path}`: cross-draft convention conflicts (sign conventions, inner-product normalization, generator symbols).\n"
-        f"4. Merge extracted physics `domain_terms` into `locked_terms` of `{profile_path}`.\n"
-        f"Write `{ledger_path}` as a JSON object whose `claims` key is the list of claim records.",
+        f"Synthesize the {len(scans)} records in `{scans_path}` (read the whole file) into four files:\n"
+        f"1. `{ledger_path}`: a JSON object whose `claims` key lists every result as {{\"id\", \"kind\" (theorem / proposition / numerical / "
+        f"definition / observation), \"statement\" (exact, with all hypotheses and quantifiers), \"numbers\" (exact values with the object each "
+        f"belongs to), \"source\" (file:lines), \"tier\": \"core\" (a headline or main-text candidate) or \"support\"}}; also keep `cited_works` and `notations`.\n"
+        f"2. `{redlines_path}`: the author's decisions and prohibitions, one per line, exact wording, with the source. Keep it short: it is the "
+        f"only rule list the writers see.\n"
+        f"3. `{story_path}`: the story material (motivation, physical pictures, surprises, history and prior work as the notes give it, "
+        f"open questions), with source pointers.\n"
+        f"4. `{conflicts_path}`: notation and convention conflicts between the sources (signs, normalisations, symbols).",
         schema={
             "type": "object",
             "properties": {
                 "claim_count": {"type": "integer"},
-                "lock_count": {"type": "integer"},
                 "conflict_count": {"type": "integer"},
                 "cited_seed_hints": {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["claim_count", "lock_count", "conflict_count", "cited_seed_hints"],
+            "required": ["claim_count", "conflict_count", "cited_seed_hints"],
         },
-        role="Synthesize Ledger & 00_locks.json",
+        role="Synthesize Material Pack",
         stage_name="inventory",
     )
-    synth_res = _require_fields(synth_res, ["claim_count", "lock_count", "conflict_count"], "Stage 0 synthesis")
+    synth_res = _require_fields(synth_res, ["claim_count", "conflict_count"], "Stage 0 synthesis")
     hints = [str(h) for h in (synth_res.get("cited_seed_hints") or [])]
-    # Persist the hints: the recommended interactive flow runs `--mode blueprint` as a separate process.
+    # Persisted: the story stage usually runs as a separate process after the author looked at the pack.
     (wf / "00_cited_seed_hints.json").write_text(json.dumps(hints, indent=2, ensure_ascii=False), encoding="utf-8")
-    for must in (ledger_path, locks_path):
+    for must in (ledger_path, redlines_path, story_path):
         if not must.exists():
             raise RuntimeError(f"Stage 0 synthesis did not write {must}")
-    log(f"Stage 0 complete: {synth_res['claim_count']} claims, {synth_res['lock_count']} locks, {synth_res['conflict_count']} conflicts")
-    return {"ledger": str(ledger_path), "locks": str(locks_path), "conflicts": str(conflicts_path), "profile": str(profile_path), "cited_seed_hints": hints, "skipped_sources": skipped_sources}
+    log(f"Stage 0 complete: {synth_res['claim_count']} results, {synth_res['conflict_count']} notation conflicts")
+    return {"ledger": str(ledger_path), "redlines": str(redlines_path), "story_material": str(story_path), "conflicts": str(conflicts_path),
+            "profile": str(profile_path), "cited_seed_hints": hints, "skipped_sources": skipped_sources}
 
 
-# ==============================================================================
-# Stage 1: Narrative Brief, Macros/Blueprint Generation + Reverse GT Audit
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Stage 1: lineage, story, block plan
+# ------------------------------------------------------------------------------
 
-async def run_blueprint(paths: Dict[str, Path], inv_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+LINEAGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "steps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "year": {"type": "string"}, "who": {"type": "string"}, "question": {"type": "string"}, "found": {"type": "string"},
+                    "left_open": {"type": "string"}, "doi": {"type": "string"}, "arxiv": {"type": "string"}, "title": {"type": "string"},
+                },
+                "required": ["who", "question", "found"],
+            },
+        },
+        "this_paper": {"type": "string"},
+    },
+    "required": ["steps"],
+}
+
+
+def verify_lineage_refs(steps: List[Dict[str, Any]], seed_bib: Path, cache: Path) -> int:
+    """Verify each step's reference with verify_citations.py (identifier plus title). The workflow runs the
+    check itself instead of trusting an agent's word; only verified BibTeX enters the seed .bib."""
+    existing = read_text_safe(seed_bib)
+    have = set(re.findall(r"@\w+\s*\{\s*([^,\s]+)\s*,", existing))
+    new_entries: List[str] = []
+    for s in steps:
+        s["verified"] = False
+        ident, flag = str(s.get("doi") or "").strip(), "--doi"
+        if not ident:
+            ident, flag = str(s.get("arxiv") or "").strip(), "--arxiv"
+        if not ident:
+            continue
+        cli = ["verify-entry", flag, ident, "--cache", str(cache)]
+        if str(s.get("title") or "").strip():
+            cli += ["--title", str(s["title"])]
+        _, _, _, res = run_tool("verify_citations.py", cli, allow_fail=True, timeout_s=300)
+        if not (res and res.get("verified") and res.get("bibtex")):
+            continue
+        s["verified"] = True
+        bib = str(res["bibtex"]).strip()
+        km = re.match(r"@\w+\s*\{\s*([^,\s]+)", bib)
+        if km:
+            s["cite_key"] = km.group(1)
+            if km.group(1) in have:
+                continue
+            have.add(km.group(1))
+        new_entries.append(bib)
+    if new_entries:
+        seed_bib.write_text((existing.strip() + "\n\n" if existing.strip() else "") + "\n\n".join(new_entries) + "\n", encoding="utf-8")
+    return len(new_entries)
+
+
+def render_lineage(steps: List[Dict[str, Any]], this_paper: str) -> str:
+    lines = ["# Lineage", "", "Each reference was checked with verify_citations.py. Cite verified ones by their key; an unverified "
+             "step may be told, but its citation stays \\cite{TODO:...} until someone verifies it.", ""]
+    for i, s in enumerate(steps, 1):
+        ident = s.get("doi") or s.get("arxiv") or "no identifier"
+        ref = f"[verified: {s['cite_key']}]" if s.get("verified") and s.get("cite_key") else ("[verified]" if s.get("verified") else f"[unverified: {ident}]")
+        lines.append(f"{i}. **{s.get('year', '')} {s.get('who', '')}** {ref}")
+        lines.append(f"   - Question: {s.get('question', '')}")
+        lines.append(f"   - Found: {s.get('found', '')}")
+        if s.get("left_open"):
+            lines.append(f"   - Left open: {s['left_open']}")
+    if this_paper:
+        lines += ["", f"**This paper:** {this_paper}"]
+    return "\n".join(lines) + "\n"
+
+
+async def run_story(paths: Dict[str, Path], inv_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     wf = paths["wf"]
     paper_dir = paths["paper"]
     args = _wf_args()
-    genre = args.get("genre", "long")
-    phase("Stage 1: Prior Literature Boundary, Blueprint Lock & Reverse GT Audit")
+    genre = str(args.get("genre") or "long")
+    phase("Stage 1: Lineage, Story and Block Plan")
+    refs = stage_refs(paths)
 
     seed_bib_path = wf / "01_verified_seed.bib"
     existing_bib = args.get("existing_bib")
@@ -1455,201 +1719,243 @@ async def run_blueprint(paths: Dict[str, Path], inv_info: Optional[Dict[str, Any
 
     hints_src = (inv_info or {}).get("cited_seed_hints")
     hints_file = wf / "00_cited_seed_hints.json"
-    if hints_src is None and hints_file.exists():  # separate `--mode blueprint` run after `--mode inventory`
+    if hints_src is None and hints_file.exists():
         try:
             hints_src = json.loads(read_text_safe(hints_file))
         except json.JSONDecodeError:
             hints_src = []
-    hints = [str(h) for h in (hints_src or [])][:12]
-    if not hints:
-        log("Stage 1: no cited_seed_hints from Stage 0; prior-literature check skipped")
-    lit_boundary: List[Any] = []
-    if hints:
-        vc = f"{resolve_python_exe()} {TOOLS_DIR / 'verify_citations.py'} verify-entry"
-        lit_boundary = await run_batched(
-            hints,
-            lambda h: dispatch_agent(
-                f"Verify prior work `{h}`.\n"
-                f"1. Run `{vc} --query \"<title words, first author, year>\"`. This only lists candidates (verified=false).\n"
-                f"2. Pick the candidate that is really this work, then run `{vc} --doi <doi> --title \"<its exact title>\"` (or `--arxiv <id>`).\n"
-                f"3. Report verified=true and its BibTeX ONLY if step 2 printed verified=true; otherwise verified=false and an empty bibtex.\n"
-                f"Also give a 1-2 sentence boundary: what the prior work did and what gap remains.",
-                schema={"type": "object", "properties": {"query": {"type": "string"}, "verified": {"type": "boolean"}, "bibtex": {"type": "string"}, "what_prior_work_did": {"type": "string"}, "remaining_gap": {"type": "string"}}, "required": ["query", "verified", "bibtex", "what_prior_work_did"]},
-                role=f"Verify Prior Ref: {h[:26]}",
-                stage_name="narrative",
-            ),
-        )
-        verified_bibs = [str(item["bibtex"]).strip() for item in lit_boundary if isinstance(item, dict) and item.get("verified") and item.get("bibtex")]
-        if verified_bibs:
-            old = read_text_safe(seed_bib_path).strip()
-            seed_bib_path.write_text((old + "\n\n" if old else "") + "\n\n".join(verified_bibs) + "\n", encoding="utf-8")
+    hints = [str(h) for h in (hints_src or [])][:20]
 
-    brief_path = wf / "01_narrative_brief.md"
-    genre_doc = read_text_safe(REFS_DIR / "genre_templates.md")
     ledger_path = wf / "00_ground_truth_ledger.json"
-    locks_path = wf / "00_locks.json"
+    material_path = wf / "00_story_material.md"
+    redlines_path = wf / "00_redlines.md"
     conflicts_path = wf / "00_conflicts_report.md"
-
-    await dispatch_agent(
-        f"Write `{brief_path}` strictly obeying `{locks_path}` and `{ledger_path}`.\n"
-        f"Sections: (1) Core Results & Exact Locks Summary, (2) Prior Literature Boundary Matrix, (3) 2-3 Candidate Narrative Arcs + Figure Plans.\n"
-        f"NEVER extrapolate fits or omit theorem hypotheses. Target genre: `{genre}`.\nRef:\n{genre_doc[:3500]}\nVerified seed lit:\n{json.dumps(lit_boundary, ensure_ascii=False)[:3500]}",
-        schema={"type": "string"},
-        role="Draft Narrative Decision Brief",
-        stage_name="narrative",
-    )
-
-    blueprint_path = Path(args["blueprint_path"]) if args.get("blueprint_path") else (wf / "01_blueprint.json")
+    lineage_path = wf / "01_lineage.md"
+    story_path = wf / "01_story.md"
+    plan_path = _plan_path()
     macros_path = paper_dir / "macros.tex"
-    await dispatch_agent(
-        f"Read `{brief_path}`, `{locks_path}`, `{ledger_path}`, and `{conflicts_path}`.\n"
-        f"Write:\n"
-        f"1. `{macros_path}`: global LaTeX macros resolving all notation conflicts cleanly. IMPORTANT: any run-in heading macro (`\\letterhead`, etc.) MUST begin with `\\par` so headings never collide with the previous paragraph.\n"
-        f"2. `{blueprint_path}`: strict JSON blueprint with title, genre, `abstract_lock_ids`, `sections` list (`id`, `file`, `title`, `role_type`, `target_words`, `assigned_ledger_claims`, `assigned_lock_ids`, `must_cover`, `do_not_repeat`, `incoming_bridge`, `outgoing_bridge`, `exported_labels`). Reference IDs in `{locks_path}` instead of writing sloppy paraphrased summaries of numbers or theorems!",
-        schema={"type": "string"},
-        role="Chief Editor Blueprint & Macros",
-        stage_name="narrative",
-    )
-    await _ensure_valid_blueprint(blueprint_path, "Chief Editor Blueprint")
+    if not ledger_path.exists():
+        raise RuntimeError(f"story: {ledger_path} is missing; run mode=inventory first")
 
-    # Stage 1C: Mandatory Reverse Blueprint-vs-GT Audit Gate
-    auth_list = [str(p) for p in collect_source_files(args.get("authority_paths") or [])]
-    rev_res = await dispatch_agent(
-        f"YOU ARE THE INDEPENDENT REVERSE BLUEPRINT AUDITOR.\n"
-        f"Do NOT trust `01_narrative_brief.md` summaries. Instead, read `{blueprint_path}` and `{macros_path}` sentence by sentence and compare DIRECTLY against raw authority documents {auth_list} and `{locks_path}`:\n"
-        f"1. Check EVERY numerical claim: reject ungrounded extrapolations, swapped residuals/errors, tightened inequality bounds, or misattributed models (e.g. assigning an unperturbed model benchmark to a perturbed model).\n"
-        f"2. Check EVERY theorem/abstract contract: reject dropped quantifiers (one-site translation, finite-range, multiplicity clauses, exact divisibility conditions, global/pointwise constraints).\n"
-        f"3. Check EVERY user redline/decision (required figure elements, canonical domain terminology, forbidden internal references).\n"
-        f"4. Verify `{macros_path}` conventions (`\\par` in heading macros, consistent operator symbols) match `{conflicts_path}` uniformly across main text and Supplemental Material.\n"
-        f"Patch ALL detected errors directly in `{blueprint_path}` and `{macros_path}`.",
-        schema={"type": "object", "properties": {"violations_found": {"type": "integer"}, "fixed_summary": {"type": "string"}}, "required": ["violations_found", "fixed_summary"]},
-        role="Reverse Blueprint-vs-GT Audit",
-        stage_name="narrative",
+    vc_query = f"{resolve_python_exe()} {TOOLS_DIR / 'verify_citations.py'} verify-entry --query"
+    hint_txt = f" Works the notes cite: {json.dumps(hints, ensure_ascii=False)}." if hints else ""
+    lineage = await dispatch_agent(
+        f"Trace the history that leads to this paper's question. Read `{material_path}` and `{ledger_path}`.{hint_txt}\n"
+        f"Give 4 to 8 steps of earlier work in time order (who, when, what question they asked, what they found, what they left open), and put "
+        f"the step this paper takes in `this_paper`, not among the steps. For a step that rests on a paper, find it with `{vc_query} \"<title words, first author, year>\"` (this only lists "
+        f"candidates) and report the DOI or arXiv id and the exact title of the right candidate; the workflow verifies them itself. Leave out "
+        f"what you cannot identify that way, and never invent a reference.",
+        schema=LINEAGE_SCHEMA,
+        role="Lineage",
+        stage_name="story",
         tier="heavy",
     )
-    log(f"Stage 1C Reverse Blueprint Audit: {rev_res}")
-    await _ensure_valid_blueprint(blueprint_path, "Reverse Blueprint Audit")  # the auditor patched the file in place
-    return {"brief": str(brief_path), "blueprint": str(blueprint_path), "macros": str(macros_path), "reverse_audit": rev_res}
+    lineage = _require_fields(lineage, ["steps"], "Lineage")
+    steps = [s for s in (lineage.get("steps") or []) if isinstance(s, dict)]
+    added = verify_lineage_refs(steps, seed_bib_path, wf / "04_api_bib_cache.json")
+    lineage_path.write_text(render_lineage(steps, str(lineage.get("this_paper") or "")), encoding="utf-8")
+    log(f"Lineage: {len(steps)} steps, {sum(1 for s in steps if s.get('verified'))} references verified, {added} added to the seed .bib")
 
-
-def validate_blueprint(bp_path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Parse 01_blueprint.json and check the fields the draft stage relies on."""
-    if not bp_path.exists():
-        return None, f"{bp_path} does not exist"
-    try:
-        data = json.loads(read_text_safe(bp_path))
-    except json.JSONDecodeError as exc:
-        return None, f"invalid JSON at line {exc.lineno} col {exc.colno}: {exc.msg}"
-    if not isinstance(data, dict):
-        return None, "top level must be a JSON object"
-    sections = data.get("sections")
-    if not isinstance(sections, list) or not sections:
-        return None, "`sections` must be a non-empty list"
-    for idx, sec in enumerate(sections):
-        if not isinstance(sec, dict):
-            return None, f"sections[{idx}] is not an object"
-        if not str(sec.get("file") or "").strip():
-            return None, f"sections[{idx}] has no `file`"
-    return data, None
-
-
-async def _ensure_valid_blueprint(bp_path: Path, after_role: str) -> Dict[str, Any]:
-    data, err = validate_blueprint(bp_path)
-    if err is None and data is not None:
-        return data
-    log(f"[blueprint] invalid after {after_role}: {err}; asking for a JSON repair")
+    sm_word = "Supplemental Material" if genre == "letter" else "appendices"
     await dispatch_agent(
-        f"`{bp_path}` must be strict JSON (no comments, no trailing commas) with a non-empty `sections` list whose items each have a "
-        f"`file` string. It currently fails validation: {err}. Fix the file in place without changing its content otherwise.",
+        f"Plan this paper together with its author. Read the ledger `{ledger_path}`, the story material `{material_path}`, the lineage "
+        f"`{lineage_path}`, the red lines `{redlines_path}`, the notation conflicts `{conflicts_path}` and the genre notes "
+        f"`{refs.get('genre_templates.md', REFS_DIR / 'genre_templates.md')}` (genre: {genre}). Write three files.\n"
+        f"1. `{story_path}`: one page the author reads before anything is drafted, in plain language: the question in one sentence; the "
+        f"lineage that leads to it; why it is still open; the answer in plain words; why it matters; what goes into the main text, what goes "
+        f"to the {sm_word} and what is left out (by ledger id); the block plan below, in prose; two or three title candidates.\n"
+        f"2. `{plan_path}`: the same plan as strict JSON: {{\"title\": str, \"blocks\": [{{\"id\": str, \"part\": \"main\" or \"sm\", "
+        f"\"file\": \"sections/<name>.tex\", \"purpose\": one sentence, \"claim_ids\": [ledger ids], \"figure_ids\": [figure ids], "
+        f"\"target_words\": int}}], \"figures\": [{{\"id\": str, \"purpose\": str, \"claim_ids\": [ledger ids]}}]}}. Main-text blocks follow "
+        f"the logical beats of the story in reading order, the question and its history first; {sm_word} blocks hold the proofs and technical "
+        f"detail. Name results only by ledger id; never restate them in the plan.\n"
+        f"3. `{macros_path}`: LaTeX macros for the notation, resolving the conflicts; a run-in heading macro must begin with `\\par`.",
         schema={"type": "string"},
-        role="Blueprint JSON Repair",
-        stage_name="narrative",
-        tier="fast",
+        role="Story and Plan",
+        stage_name="story",
+        tier="heavy",
     )
-    data, err = validate_blueprint(bp_path)
-    if err is not None or data is None:
-        raise RuntimeError(f"01_blueprint.json is still invalid after repair: {err}")
-    return data
+    plan = await _ensure_valid_plan(plan_path, ledger_path)
+    n_main = sum(1 for b in plan["blocks"] if b["part"] == "main")
+    log(f"Story stage complete: {n_main} main-text blocks, {len(plan['blocks']) - n_main} {sm_word} blocks. Read {story_path} before drafting.")
+    return {"story": str(story_path), "plan": str(plan_path), "lineage": str(lineage_path), "macros": str(macros_path),
+            "main_blocks": n_main, "sm_blocks": len(plan["blocks"]) - n_main}
 
 
-# ==============================================================================
-# Stage 2: Few-Shot Parallel Section Drafting & Continuity Assembly
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Stage 2: drafting (one author for the main text, block by block; SM blocks in parallel)
+# ------------------------------------------------------------------------------
+
+BLOCK_SCHEMA = {
+    "type": "object",
+    "properties": {"file": {"type": "string"}, "words": {"type": "integer"}, "todos": {"type": "array", "items": {"type": "string"}}},
+    "required": ["file"],
+}
+
+
+def write_skeleton(tex_path: Path, files: Sequence[str], genre: str, title: str, supplement: bool) -> bool:
+    """Write main.tex / supplement.tex when absent: preamble, placeholders and the block inputs in plan order."""
+    if tex_path.exists():
+        return False
+    opts = "aps,prl,twocolumn,superscriptaddress,longbibliography" if (genre == "letter" and not supplement) else "aps,prb,twocolumn,superscriptaddress,longbibliography"
+    shown_title = ("Supplemental Material: " + title) if (supplement and title) else (title or "TITLE")
+    text = (
+        "\\documentclass[" + opts + "]{revtex4-2}\n\\usepackage{amsmath,amssymb,graphicx}\n\\input{macros.tex}\n"
+        "\\providecommand{\\todo}[1]{\\textbf{[TODO: #1]}}\n\n\\begin{document}\n\n"
+        "\\title{" + shown_title + "}\n\\author{[Authors]}\n\\date{\\today}\n\n"
+    )
+    if not supplement:
+        text += "\\begin{abstract}\nABSTRACT\n\\end{abstract}\n\n"
+    text += "\\maketitle\n\n" + "\n".join("\\input{" + f + "}" for f in files) + "\n\n"
+    if not supplement:
+        text += "\\begin{acknowledgments}\n[Acknowledgments]\n\\end{acknowledgments}\n\n"
+    text += "\\bibliography{refs}\n\n\\end{document}\n"
+    tex_path.parent.mkdir(parents=True, exist_ok=True)
+    tex_path.write_text(text, encoding="utf-8")
+    return True
+
+
+def author_system_prompt(m: Dict[str, str], exemplars: Sequence[str]) -> str:
+    ex = f" and the exemplar papers {list(exemplars)}" if exemplars else ""
+    return (
+        "You are the author of the main text of a physics paper. You write it block by block over several turns, one block per turn. "
+        f"Before the first block read the story `{m['story']}`, the block plan `{m['plan']}`, the notation `{m['macros']}`, the genre notes "
+        f"`{m['genre']}`, the voice samples under `categorized_exemplars` in `{m['profile']}`{ex}, and the author's red lines `{m['redlines']}`. "
+        "Write for a physicist outside the subfield: say why before how, give each result in words before its formula, and keep one story "
+        "running through all blocks. Three bottom lines: (1) state no fact that is not in the material (ledger records, story, lineage); where "
+        "something is missing write \\todo{...}; (2) a theorem, lemma or proposition keeps the hypotheses and quantifiers of its ledger record "
+        "(reformat it freely, never weaken or strengthen it); (3) nothing the red lines forbid. "
+        f"Cite only keys that exist in `{m['bib']}`; otherwise write \\cite{{TODO:short description}}."
+    )
+
+
+def main_block_prompt(b: Dict[str, Any], i: int, n: int, done: Sequence[str], paper_dir: Path, index: Dict[str, Dict[str, Any]]) -> str:
+    done_s = ", ".join(f"`{paper_dir / f}`" for f in done)
+    prev = f"Already written (continue the story from where they end): {done_s}" if done else "This is the opening block."
+    fig_ids = [str(x) for x in (b.get("figure_ids") or [])]
+    figs = f"Figures to place in this block: {', '.join(fig_ids)}.\n" if fig_ids else ""
+    return (
+        f"Block {i}/{n} `{b['id']}`: write `{paper_dir / b['file']}` (about {int(b.get('target_words') or 400)} words; end the file with a blank line).\n"
+        f"Its job in the story: {b['purpose']}\n{prev}\n{figs}"
+        f"Ledger records for this block (exact):\n{ledger_records(index, b.get('claim_ids') or [])}\n"
+        "Write only this block's file. Reply with the file path, a word count and any \\todo items you left."
+    )
+
+
+def abstract_prompt(main_tex: Path, main_files: Sequence[str], genre: str) -> str:
+    limit = ABSTRACT_LIMITS.get(genre)
+    lim = f"The venue allows at most {limit} characters including spaces (counted automatically afterwards)." if limit else "Aim for 150 to 220 words."
+    return (
+        f"All main-text blocks are written. Now write the title and the abstract in `{main_tex}`, replacing the placeholders. "
+        "The abstract tells the story in miniature: the context and the question, the answer in words, and why it matters. "
+        f"Explain inside the abstract every symbol and acronym it uses, and prefer words to symbols. {lim} "
+        f"Make sure `{main_tex}` inputs `macros.tex` and the block files in this order: {', '.join(main_files)}. "
+        "Leave the author list and the acknowledgments placeholders for the human author."
+    )
+
+
+def readthrough_prompt(main_tex: Path, main_files: Sequence[str], paper_dir: Path) -> str:
+    files = ", ".join(f"`{paper_dir / f}`" for f in main_files)
+    return (
+        f"Read the whole main text in order: `{main_tex}`, then {files}. Smooth the transitions, remove repetition, and make the "
+        "introduction promise exactly what the body delivers. Keep the edits small and add no new results. Reply with a short list of what you changed."
+    )
+
+
+def sm_block_prompt(b: Dict[str, Any], m: Dict[str, str], paper_dir: Path, index: Dict[str, Dict[str, Any]], genre: str) -> str:
+    where = "Supplemental Material" if genre == "letter" else "appendix"
+    return (
+        f"Write the {where} block `{b['id']}` into `{paper_dir / b['file']}` (about {int(b.get('target_words') or 800)} words; end the file with a blank line).\n"
+        f"Its job: {b['purpose']}\n"
+        f"Read the notation `{m['macros']}`, the plan `{m['plan']}` (to see what the main text says) and the red lines `{m['redlines']}`.\n"
+        "Rigour first: complete proofs and derivations with every step, and every hypothesis stated. State no fact that is not in the "
+        f"material; write \\todo{{...}} where something is missing; cite only keys in `{m['bib']}`, otherwise \\cite{{TODO:short description}}.\n"
+        f"Ledger records for this block (exact):\n{ledger_records(index, b.get('claim_ids') or [])}\n"
+        "Write only this file. Reply with the file path, a word count and any \\todo items you left."
+    )
+
 
 async def run_draft(paths: Dict[str, Path]) -> Dict[str, Any]:
     wf = paths["wf"]
     paper_dir = paths["paper"]
     args = _wf_args()
-    bp_path = Path(args["blueprint_path"]) if args.get("blueprint_path") else (wf / "01_blueprint.json")
-    blueprint, bp_err = validate_blueprint(bp_path)
-    if bp_err is not None or blueprint is None:
-        raise RuntimeError(f"Cannot draft: {bp_path} is not a usable blueprint ({bp_err}). Run `--mode blueprint` first or fix the file.")
-    macros_txt = read_text_safe(paper_dir / "macros.tex")
-    prof_path = ensure_default_profile(paths)
-    style_prof = json.loads(read_text_safe(prof_path))
-    locks_txt = read_text_safe(wf / "00_locks.json")
-    genre_doc = read_text_safe(REFS_DIR / "genre_templates.md")
-    seed_bib = read_text_safe(wf / "01_verified_seed.bib")
+    genre = str(args.get("genre") or "long")
+    ledger_path = wf / "00_ground_truth_ledger.json"
+    plan = await _ensure_valid_plan(_plan_path(), ledger_path)
+    index = _ledger_index(ledger_path)
+    refs = stage_refs(paths)
+    profile_path = ensure_default_profile(paths)
 
     refs_bib = paper_dir / "refs.bib"
-    if not refs_bib.exists() and seed_bib:
+    seed_bib = read_text_safe(wf / "01_verified_seed.bib")
+    if not refs_bib.exists() and seed_bib.strip():
         refs_bib.write_text(seed_bib, encoding="utf-8")
 
-    fewshot_block = json.dumps(style_prof.get("categorized_exemplars") or style_prof.get("exemplar_paragraphs") or [], indent=2, ensure_ascii=False)[:4500]
-    sections: List[Dict[str, Any]] = blueprint.get("sections", [])
-    tech_sections = [s for s in sections if s.get("role_type", "body") in ("body", "appendix", "supp")] or sections
+    main_blocks = [b for b in plan["blocks"] if b["part"] == "main"]
+    sm_blocks = [b for b in plan["blocks"] if b["part"] == "sm"]
+    main_files = [b["file"] for b in main_blocks]
+    main_tex = paper_dir / "main.tex"
+    supp_tex = resolve_supplement_path(paper_dir) or (paper_dir / "supplement.tex")
+    title = str(plan.get("title") or "")
+    if write_skeleton(main_tex, main_files, genre, title, supplement=False):
+        log(f"[draft] wrote the skeleton {main_tex}")
+    if sm_blocks and write_skeleton(supp_tex, [b["file"] for b in sm_blocks], genre, title, supplement=True):
+        log(f"[draft] wrote the skeleton {supp_tex}")
 
-    phase("Stage 2: Few-Shot Parallel Section Drafting & Continuity Assembly")
-    section_schema = {
-        "type": "object",
-        "properties": {"file": {"type": "string"}, "word_estimate": {"type": "integer"}, "todo_citations": {"type": "array", "items": {"type": "string"}}, "exported_labels_written": {"type": "array", "items": {"type": "string"}}},
-        "required": ["file", "todo_citations"],
+    m = {
+        "story": str(wf / "01_story.md"), "plan": str(_plan_path()), "macros": str(paper_dir / "macros.tex"),
+        "genre": str(refs.get("genre_templates.md", REFS_DIR / "genre_templates.md")), "profile": str(profile_path),
+        "redlines": str(wf / "00_redlines.md"), "bib": str(refs_bib),
     }
+    exemplars = [str(x) for x in (args.get("exemplar_paths") or [])]
 
-    draft_results = await run_batched(
-        tech_sections,
-        lambda sec: dispatch_agent(
-            f"Draft section `{sec['file']}` inside `{paper_dir}` following ALL contracts, locks, and Few-Shot voice examples.\n\n"
-            f"Section contract:\n{json.dumps(sec, indent=2, ensure_ascii=False)}\n\n"
-            f"Hard Locks (`00_locks.json`) — NEVER relax quantifiers or alter locked numbers:\n{locks_txt[:4500]}\n\n"
-            f"Mandatory `macros.tex`:\n```latex\n{macros_txt}\n```\n\n"
-            f"FEW-SHOT EXEMPLAR VOICE SAMPLES (imitate the group's natural clause rhythm, transitions & restraint; NEVER chop prose into telegraphic <=8-word bullets):\n{fewshot_block}\n\n"
-            f"Rules:\n"
-            f"1. 4-Part Golden Structure (Motivation -> Definitions in-situ + intuition -> Zero-skip derivation -> Physical verdict).\n"
-            f"2. Define EVERY symbol upon first use in main text. Introduce explicit microscopic model equations in the Letter body.\n"
-            f"3. NEVER print internal ledger tags (`Lemma L1/L2`, `Grade N`, `Refl-2`) or uncompiled `\\iffalse` comments.\n"
-            f"4. NEVER invent BibTeX keys; use `\\cite{{TODO:short_claim}}` if uncertain and list in `todo_citations`.\n"
-            f"5. End every `.tex` segment file with an explicit trailing blank line.\n"
-            f"6. Write ONLY `{paper_dir / sec['file']}`; other agents are drafting the other sections in parallel.\n\n"
-            f"Genre norms:\n{genre_doc[:2500]}",
-            schema=section_schema,
-            role=f"Draft {sec.get('id', sec['file'])}",
-            stage_name="draft",
-        ),
-    )
+    phase("Stage 2: One Author Writes the Main Text Block by Block; SM Blocks in Parallel")
+    author = create_persistent_handle(author_system_prompt(m, exemplars), role="Author", stage_name="draft", tier="builder")
+    results: Dict[str, List[Any]] = {"main": [], "sm": []}
 
-    supp_path = resolve_supplement_path(paper_dir) or (paper_dir / "supplement.tex")
-    await dispatch_agent(
-        f"You are Lead Continuity Editor for `{paper_dir}`.\n"
-        f"1. Read drafted files from `{bp_path}` and inspect `{locks_txt[:3000]}`.\n"
-        f"2. Finalize Abstract (with explicit definitions, all hypotheses/quantifiers matching main theorems, `<=600` PRL chars), Intro, Discussion, `Acknowledgments`, and `Data Availability`.\n"
-        f"3. Ensure `main.tex` (and `{supp_path}` if Supplemental Material sections exist) inputs `macros.tex`, sections in order, and uses formal `\\cite{{SM}}` or synchronized section headers (`Sec. S...` vs `Appendix S...`).\n"
-        f"4. Maintain natural connected prose (zero staccato sentence chopping) and match Few-Shot samples.\n"
-        f"Draft outputs:\n{json.dumps(draft_results, indent=2, ensure_ascii=False)}",
-        schema={"type": "string"},
-        role="Lead Continuity Editor & Assembly",
-        stage_name="draft",
-    )
+    async def write_main() -> None:
+        done: List[str] = []
+        for i, b in enumerate(main_blocks, 1):
+            results["main"].append(await call_persistent_handle(author, main_block_prompt(b, i, len(main_blocks), done, paper_dir, index), BLOCK_SCHEMA))
+            done.append(b["file"])
+        await call_persistent_handle(author, abstract_prompt(main_tex, main_files, genre), {"type": "string"})
+        await call_persistent_handle(author, readthrough_prompt(main_tex, main_files, paper_dir), {"type": "string"})
 
+    async def write_sm() -> None:
+        if sm_blocks:
+            bs = max(1, int(_STATE["batch_size"] or 4) - 1)  # the author already uses one slot
+            results["sm"] = await run_batched(
+                sm_blocks,
+                lambda b: dispatch_agent(sm_block_prompt(b, m, paper_dir, index, genre), schema=BLOCK_SCHEMA, role=f"SM {b['id']}", stage_name="draft"),
+                batch_size=bs,
+            )
+
+    await _gather_fail_fast([write_main(), write_sm()])
+    author.pop("handle", None)
     snapshot_tex_files(paper_dir, paths["raw_drafts"])
-    run_tool("audit_tex_defs.py", ["--main", str(paper_dir / "main.tex"), "--json-out", str(wf / "02_tex_defs_audit.json")], allow_fail=True)
-    log(f"Stage 2 drafted {len(draft_results)} sections; raw snapshot saved.")
-    return {"drafted_sections": len(draft_results), "raw_snapshot": str(paths["raw_drafts"])}
+    todos = [t for r in results["main"] + results["sm"] if isinstance(r, dict) for t in (r.get("todos") or [])]
+    return {"main_blocks": len(main_blocks), "sm_blocks": len(sm_blocks), "main_tex": str(main_tex), "todos": todos}
 
 
-# ==============================================================================
-# Stage 6 / On-Demand Figures Phase: PRL/Nature Visual Language + PyMuPDF Hard Gate
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Figures
+# ------------------------------------------------------------------------------
+
+def _figure_specs(paths: Dict[str, Path]) -> List[Dict[str, Any]]:
+    args = _wf_args()
+    sp_arg = args.get("figure_specs_path")
+    if sp_arg and Path(str(sp_arg)).exists():
+        raw_sp = json.loads(read_text_safe(Path(str(sp_arg))))
+        return raw_sp if isinstance(raw_sp, list) else raw_sp.get("figures", [])
+    scripts = sorted(paths["fig_scripts"].glob("make_fig*.py"))
+    if scripts:
+        return [{"id": py.stem.replace("make_", ""), "script_path": str(py)} for py in scripts]
+    plan, _ = validate_plan(_plan_path())
+    if plan is not None:
+        return [f for f in (plan.get("figures") or []) if isinstance(f, dict)]
+    bp, _ = validate_blueprint(Path(str(args.get("blueprint_path") or (paths["wf"] / "01_blueprint.json"))))  # v2 workspaces
+    return [f for f in ((bp or {}).get("figures") or []) if isinstance(f, dict)]
+
 
 async def run_figures(paths: Dict[str, Path]) -> Dict[str, Any]:
     paper_dir = paths["paper"]
@@ -1657,41 +1963,29 @@ async def run_figures(paths: Dict[str, Path]) -> Dict[str, Any]:
     fig_scripts = paths["fig_scripts"]
     fig_renders = paths["fig_renders"]
     fig_style = str(_wf_args().get("figure_style") or "prl").lower()
-    vis_spec = read_text_safe(REFS_DIR / "figure_visual_language.md")
     theme_src = TOOLS_DIR / "journal_fig_theme.py"
+    refs = stage_refs(paths)
+    index = _ledger_index(paths["wf"] / "00_ground_truth_ledger.json")
 
     phase(f"Figures Phase ({fig_style.upper()} House Style + PyMuPDF Hard Gate)")
     fig_scripts.mkdir(parents=True, exist_ok=True)
     if theme_src.exists():
         copy_to_workflow(theme_src, fig_scripts / "journal_fig_theme.py")
 
-    specs: List[Dict[str, Any]] = []
-    sp_arg = _wf_args().get("figure_specs_path")
-    if sp_arg and Path(str(sp_arg)).exists():
-        raw_sp = json.loads(read_text_safe(Path(str(sp_arg))))
-        specs = raw_sp if isinstance(raw_sp, list) else raw_sp.get("figures", [])
-    elif list(fig_scripts.glob("make_fig*.py")):
-        for py in sorted(fig_scripts.glob("make_fig*.py")):
-            specs.append({"id": py.stem.replace("make_", ""), "script_path": str(py)})
-    else:
-        bp, bp_err = validate_blueprint(Path(str(_wf_args().get("blueprint_path") or (paths["wf"] / "01_blueprint.json"))))
-        if bp is not None:
-            specs = [s for s in (bp.get("figures") or []) if isinstance(s, dict)]
-        elif (paths["wf"] / "01_blueprint.json").exists():
-            log(f"Figures: blueprint unusable ({bp_err}); no figure specs")
-
+    specs = _figure_specs(paths)
     if specs:
-        locks_txt = read_text_safe(paths["wf"] / "00_locks.json")
         await run_batched(
             specs,
             lambda sp: dispatch_agent(
-                f"Create or refactor figure builder `{sp.get('script_path') or (fig_scripts / ('make_' + sp.get('id', 'fig') + '.py'))}` targeting `{fig_dir}` under `{fig_style}` house style.\n"
-                f"MANDATORY VISUAL RULES:\n"
-                f"1. Import `journal_fig_theme` from `{fig_scripts}` (`apply_house_style('{fig_style}')`, `add_panel_label`, `PALETTE`, `DIMENSIONS`). NEVER use DejaVu fonts, Tailwind hex cards, `FancyBboxPatch(round)`, status pills, `ax.set_title()`, `ax.table()`, lollipop stems, or proof prose flowcharts.\n"
-                f"2. Match ALL notations & numbers strictly against `{paper_dir / 'macros.tex'}` and locks:\n{locks_txt[:2500]}\n"
-                f"3. Move descriptive panel titles, constant run parameters, and error bounds into caption text—keep figure canvas clean with >=7pt PRL / >=5pt Nature labels and zero overlapping strokes.\n"
-                f"4. After editing the script, execute `{resolve_python_exe()} <script_path>` so updated PDF is written to `{fig_dir}`.\n\n"
-                f"Figure Spec:\n{json.dumps(sp, indent=2, ensure_ascii=False)}\n\nVisual Language Reference:\n{vis_spec[:3500]}",
+                f"Create or refactor the figure builder `{sp.get('script_path') or (fig_scripts / ('make_' + str(sp.get('id', 'fig')) + '.py'))}` "
+                f"writing into `{fig_dir}` in the `{fig_style}` house style.\n"
+                f"Read the visual rules `{refs.get('figure_visual_language.md', REFS_DIR / 'figure_visual_language.md')}` and the notation `{paper_dir / 'macros.tex'}`.\n"
+                f"1. Import `journal_fig_theme` from `{fig_scripts}` (`apply_house_style('{fig_style}')`, `add_panel_label`, `PALETTE`, `DIMENSIONS`).\n"
+                f"2. Every number and label must match the ledger records below (exact values and the objects they belong to) and `macros.tex`.\n"
+                f"3. Keep the canvas clean: panel titles, run parameters and error bounds go into the caption; labels at least 7 pt (PRL) / 5 pt (Nature); no overlapping strokes.\n"
+                f"4. After editing the script, run `{resolve_python_exe()} <script_path>` so the PDF is written to `{fig_dir}`.\n\n"
+                f"Figure spec:\n{json.dumps(sp, indent=2, ensure_ascii=False)}\n\n"
+                f"Ledger records for this figure (exact):\n{ledger_records(index, sp.get('claim_ids') or [])}",
                 schema={"type": "string"},
                 role=f"Figure Design: {sp.get('id', 'fig')}",
                 stage_name="figures",
@@ -1703,15 +1997,8 @@ async def run_figures(paths: Dict[str, Path]) -> Dict[str, Any]:
     for rnd in range(3):
         rc_fig, _, _, fig_rep = run_tool(
             "verify_figures.py",
-            [
-                "--pdf-dir", str(fig_dir),
-                "--scripts-dir", str(fig_scripts),
-                "--tex-dir", str(paper_dir),
-                "--style", fig_style,
-                "--renders-out", str(fig_renders),
-                "--json-out", str(fig_json),
-                "--md-out", str(fig_md),
-            ],
+            ["--pdf-dir", str(fig_dir), "--scripts-dir", str(fig_scripts), "--tex-dir", str(paper_dir), "--style", fig_style,
+             "--renders-out", str(fig_renders), "--json-out", str(fig_json), "--md-out", str(fig_md)],
             allow_fail=True,
         )
         if rc_fig == 0 or rnd == 2 or not fig_rep:
@@ -1721,362 +2008,603 @@ async def run_figures(paths: Dict[str, Path]) -> Dict[str, Any]:
         ast_fails = fig_rep.get("script_ai_findings", [])
         if not failing_figs and not ast_fails:
             break
-        log(f"verify_figures.py round {rnd + 1} caught {len(failing_figs)} failing figures and {len(ast_fails)} AST AI tells; running visual repair")
+        log(f"verify_figures.py round {rnd + 1} caught {len(failing_figs)} failing figures and {len(ast_fails)} AST findings; repairing")
         await run_batched(
             failing_figs,
             lambda ff: dispatch_agent(
-                f"Repair figure PDF `{ff['file']}` (its builder script in `{fig_scripts}` and PNG preview `{ff.get('previews', {}).get('rgb_300dpi')}`) to clear ALL hard-gate failures below.\n"
-                f"Also inspect `{paper_dir / 'sections'}` if caption/symbol text needs bidirectional harmonization (NEVER break figure-vs-text agreement!).\n"
-                f"Inspect ONLY PNG previews (including any `zoom_*.png` in `{fig_renders}`), NEVER load multi-page PDFs.\n"
-                f"Failures:\n{json.dumps(ff, indent=2, ensure_ascii=False)[:3500]}\nScript AST issues:\n{json.dumps(ast_fails[:12], indent=2)}",
+                f"Repair figure PDF `{ff['file']}` (its builder script in `{fig_scripts}` and PNG preview `{ff.get('previews', {}).get('rgb_300dpi')}`) to clear every failure below.\n"
+                f"If a caption or symbol must change, keep figure and text in agreement (`{paper_dir / 'sections'}`).\n"
+                f"Inspect only PNG previews (including any `zoom_*.png` in `{fig_renders}`), never multi-page PDFs.\n"
+                f"Failures:\n{json.dumps(ff, indent=2, ensure_ascii=False)}\nScript findings:\n{json.dumps(ast_fails, indent=2)}",
                 schema={"type": "string"},
                 role=f"Fix Fig: {Path(ff['file']).name}",
                 stage_name="figures",
             ),
         )
-
     return {"figure_report": str(fig_md), "figure_json": str(fig_json), "renders_dir": str(fig_renders)}
 
 
-# ==============================================================================
-# Stage 3: 3-Way Cross-Verification (Raw Authority + SymPy + Defs Audit)
-# ==============================================================================
-
-def _ledger_claims(ledger_path: Path) -> List[Dict[str, Any]]:
-    """The ledger is agent-written: accept {"claims": [...]}, close variants, or a bare list."""
+def _wants_figures(paths: Dict[str, Path]) -> bool:
     try:
-        data = json.loads(read_text_safe(ledger_path) or "null")
-    except json.JSONDecodeError as exc:
-        log(f"[ledger] {ledger_path} is not valid JSON ({exc.msg} at line {exc.lineno})")
-        return []
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict):
-        items = next((data[k] for k in ("claims", "verified_claims", "ledger", "entries", "items") if isinstance(data.get(k), list)), [])
-    else:
-        items = []
+        return bool(_figure_specs(paths))
+    except (OSError, ValueError):
+        return False
+
+
+# ------------------------------------------------------------------------------
+# Stage 3: check (report only)
+# ------------------------------------------------------------------------------
+
+ISSUE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string"}, "location": {"type": "string"}, "quote": {"type": "string"}, "problem": {"type": "string"},
+                    "evidence": {"type": "string"}, "severity": {"type": "string", "enum": list(SEVERITIES)}, "suggested_fix": {"type": "string"},
+                },
+                "required": ["file", "problem", "severity"],
+            },
+        },
+    },
+    "required": ["issues"],
+}
+ISSUE_FORMAT = (
+    "Do not edit any file. For each issue give `file` (path relative to the paper directory), `location` (line number or the first words), "
+    "`quote` (the exact text), `problem`, `evidence` (source file:line, ledger id or script), `severity` (high = wrong or overclaimed, "
+    "medium = imprecise or unclear, low = minor) and, if you have one, `suggested_fix`. An empty list is a valid answer."
+)
+_BAD_BIB_STATUSES = ("EPRINT_DOI_MISMATCH", "EPRINT_NOT_FOUND", "AUTHOR_ORDER_MISMATCH", "IDENTIFIER_NOT_FOUND", "METADATA_MISMATCH", "UNVERIFIED_NO_MATCH")
+
+
+def resolve_paper_file(paper_dir: Path, raw: Any) -> Optional[str]:
+    """Map a file named by an agent to an existing paper-relative path. Agents mix paths relative to the paper,
+    relative to their own working directory (`paper/sections/x.tex`) and absolute ones; two spellings of one file
+    must not become two work items (the edit guard would then revert one agent's edits). None = outside the paper."""
+    s = str(raw or "").strip().replace("\\", "/")
+    if not s:
+        return None
+    rel = _paper_rel(paper_dir, s)
+    if rel is not None and (paper_dir / rel).exists():
+        return rel
+    p = Path(s)
+    if not p.is_absolute():
+        try:
+            via_cwd = str((Path.cwd() / p).resolve().relative_to(paper_dir.resolve())).replace("\\", "/")
+            if (paper_dir / via_cwd).exists():
+                return via_cwd
+        except ValueError:
+            pass
+    if rel is None:
+        return None
+    known = [str(f.relative_to(paper_dir)).replace("\\", "/") for f in list_editable_tex(paper_dir)]
+    known += [n for n in ("macros.tex", "refs.bib") if (paper_dir / n).exists()]
+    hits = [k for k in known if rel == k or rel.endswith("/" + k)]
+    return max(hits, key=len) if hits else rel
+
+
+def collect_issues(paper_dir: Path, reports: Sequence[Any], source: str) -> List[Dict[str, Any]]:
+    """Normalise checker output: paper-relative paths, known severities, a source tag; drop issues for files outside the paper."""
     out: List[Dict[str, Any]] = []
-    for i, it in enumerate(items):
-        out.append(it if isinstance(it, dict) else {"id": f"C{i + 1}", "summary": str(it)})
+    for rep in reports:
+        if not isinstance(rep, dict):
+            raise RuntimeError(f"{source}: checker returned a non-object result: {str(rep)[:300]}")
+        for it in rep.get("issues") or []:
+            if not isinstance(it, dict) or not str(it.get("problem") or "").strip():
+                continue
+            raw_file = str(it.get("file") or "").strip()
+            rel = resolve_paper_file(paper_dir, raw_file) if raw_file else ""
+            if rel is None:
+                log(f"[check] dropped an issue for a file outside the paper directory: {raw_file}")
+                continue
+            sev = str(it.get("severity") or "medium").lower()
+            out.append({**it, "file": rel, "severity": sev if sev in SEVERITIES else "medium", "source": it.get("source") or source})
     return out
 
 
-async def run_verify(paths: Dict[str, Path]) -> Dict[str, Any]:
+def dedupe_issues(issues: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    for it in issues:
+        key = (it.get("file", ""), re.sub(r"\s+", " ", str(it.get("quote") or it.get("problem") or "")).strip().lower()[:200])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    order = {s: i for i, s in enumerate(SEVERITIES)}
+    return sorted(out, key=lambda i: (order.get(i["severity"], 1), str(i.get("file", "")), str(i.get("location", ""))))
+
+
+def _det_issue(paper_dir: Path, loc: Any, problem: str, severity: str, kind: str, source: str, default_file: str = "") -> Dict[str, Any]:
+    m = re.search(r"([^:]+\.(?:tex|bib)):(\d+)\s*$", str(loc or ""))
+    rel = (resolve_paper_file(paper_dir, m.group(1)) or m.group(1).replace("\\", "/")) if m else default_file
+    return {"file": rel, "location": m.group(2) if m else "", "problem": problem, "severity": severity, "kind": kind, "source": source}
+
+
+def issues_from_defs(paper_dir: Path, rep: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not rep:
+        return []
+    out: List[Dict[str, Any]] = []
+    for t in rep.get("internal_tag_leaks") or []:
+        out.append(_det_issue(paper_dir, t.get("location"), f"internal tag in the text: {t.get('match')}", "high", "leak", "audit_tex_defs"))
+    for u in rep.get("unresolved_refs") or []:
+        out.append(_det_issue(paper_dir, u.get("location"), f"{u.get('kind')}: {u.get('target')}", "high", "structure", "audit_tex_defs"))
+    for s in rep.get("section_mismatches") or []:
+        out.append(_det_issue(paper_dir, s.get("location"), f"{s.get('kind')}: {s.get('excerpt', '')}", "low", "structure", "audit_tex_defs", "main.tex"))
+    for s in rep.get("undefined_main_symbols") or []:
+        where = f" (first use: {s['first_use_excerpt']})" if s.get("first_use_excerpt") else ""
+        out.append(_det_issue(paper_dir, "", f"{s.get('kind')}: {s.get('symbol')}{where}", "medium", "reader", "audit_tex_defs", "main.tex"))
+    for a in rep.get("abstract_issues") or []:
+        if a.get("kind") == "abstract_too_long":
+            out.append(_det_issue(paper_dir, "", f"the abstract is about {a.get('chars')} characters; the venue limit is {a.get('limit')}", "high", "length", "audit_tex_defs", "main.tex"))
+        else:
+            out.append(_det_issue(paper_dir, "", f"the abstract uses the acronym {a.get('acronym')} without expanding it", "medium", "reader", "audit_tex_defs", "main.tex"))
+    for d in rep.get("dual_symbol_conflicts") or []:
+        out.append(_det_issue(paper_dir, "", str(d.get("detail") or d), "low", "wording", "audit_tex_defs", "main.tex"))
+    return out
+
+
+def issues_from_citations(paper_dir: Path, rep: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not rep:
+        return [_det_issue(paper_dir, "", "the citation audit produced no report", "high", "citation", "verify_citations", "refs.bib")]
+    out: List[Dict[str, Any]] = []
+    for e in rep.get("entries") or []:
+        if e.get("is_cited") and e.get("status") in _BAD_BIB_STATUSES:
+            out.append(_det_issue(paper_dir, "", f"reference {e.get('key')}: {e.get('status')}", "high", "citation", "verify_citations", "refs.bib"))
+    for t in rep.get("todo_placeholders") or []:
+        for loc in (t.get("locations") or [""]):
+            out.append(_det_issue(paper_dir, loc, f"unresolved citation placeholder {t.get('key')}", "medium", "citation", "verify_citations", "main.tex"))
+    net = rep.get("network_unverified_keys") or []
+    if net:
+        out.append(_det_issue(paper_dir, "", f"{len(net)} cited entries could not be checked (network): {net[:10]}", "medium", "citation", "verify_citations", "refs.bib"))
+    return out
+
+
+def issues_from_scans(paper_dir: Path, wm: Optional[Dict[str, Any]], sty: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for fr in (wm or {}).get("files") or []:
+        rel = _paper_rel(paper_dir, fr.get("file") or "") or ""
+        for h in (fr.get("copyedit_issues") or []) + (fr.get("ai_slop_hits") or []):
+            out.append({"file": rel, "location": str(h.get("line", "")) if isinstance(h, dict) else "",
+                        "problem": "copy-edit: " + json.dumps(h, ensure_ascii=False)[:240], "severity": "low", "kind": "copyedit", "source": "clean_watermarks"})
+    for fr in (sty or {}).get("files") or []:
+        if fr.get("staccato_warning"):
+            rel = _paper_rel(paper_dir, fr.get("file") or "") or ""
+            out.append({"file": rel, "location": "", "problem": f"runs of very short sentences: {json.dumps(fr.get('staccato_warning'), ensure_ascii=False)[:240]}",
+                        "severity": "low", "kind": "flow", "source": "style_metrics"})
+    return out
+
+
+async def citation_pass(paths: Dict[str, Path]) -> Optional[Dict[str, Any]]:
+    """Reference metadata only: audit the .bib, resolve `\\cite{TODO:...}` placeholders that can be verified, repair
+    wrong metadata in refs.bib. Prose is never rewritten here."""
     paper_dir = paths["paper"]
     wf = paths["wf"]
-    audit_dir = paths["audit"]
-    ledger_path = wf / "00_ground_truth_ledger.json"
-    locks_path = wf / "00_locks.json"
-    args = _wf_args()
-    auth_files = [str(p) for p in collect_source_files(args.get("authority_paths") or args.get("source_paths") or [])]
-
-    phase("Stage 3: 3-Way Raw-Authority Cross-Verification, SymPy & Defs Audit")
-    run_tool("audit_tex_defs.py", ["--main", str(paper_dir / "main.tex"), "--json-out", str(wf / "03_tex_defs_audit.json"), "--md-out", str(audit_dir / "00_tex_defs_audit.md")], allow_fail=True)
-
-    tex_files = list_editable_tex(paper_dir)
-    issue_schema = {
-        "type": "object",
-        "properties": {
-            "target": {"type": "string"},
-            "auto_fixable": {"type": "array", "items": {"type": "object", "properties": {"file": {"type": "string"}, "location": {"type": "string"}, "description": {"type": "string"}, "exact_fix": {"type": "string"}}, "required": ["file", "description", "exact_fix"]}},
-            "fundamental_blockers": {"type": "array", "items": {"type": "object", "properties": {"file": {"type": "string"}, "claim_or_eq": {"type": "string"}, "diagnostic": {"type": "string"}, "counterexample_or_script": {"type": "string"}}, "required": ["file", "claim_or_eq", "diagnostic"]}},
-        },
-        "required": ["target", "auto_fixable", "fundamental_blockers"],
-    }
-
-    rev_3a = [
-        create_persistent_handle(
-            (
-                f"Channel 3A Raw-Authority Reviewer: verify `{f}` DIRECTLY against raw source/authority files {auth_files}, `{locks_path}`, and `{ledger_path}` (NOT against blueprint!). "
-                f"Verify theorem proof chains have zero missing intermediate lemmas, hypotheses/quantifiers match exactly, and numeric attributions match exact physical Hamiltonians."
-            ),
-            role=f"3A Trace: {f.name}",
-            stage_name="cross_verify",
-            read_only=True,
-            tier="heavy",
-        )
-        for f in tex_files
-    ]
-
-    claims = _ledger_claims(ledger_path)[:12]
-    if not claims:
-        log(f"Stage 3: no claim list found in {ledger_path}; 3B runs one generic identity/counterexample check")
-        claims = [{"id": "MAIN-CHECK", "summary": "Verify core algebraic identities & counterexamples"}]
-    rev_3b = [
-        create_persistent_handle(
-            f"Channel 3B Independent Python/SymPy Reviewer (use `{resolve_python_exe()}`): write & run standalone check script in `{paths['verify_scripts']}` verifying claim identities & testing boundary counterexamples cleanly.",
-            role=f"3B SymPy: {c.get('id', 'Claim')}",
-            stage_name="cross_verify",
-            read_only=False,
-        )
-        for c in claims
-    ]
-
-    rev_3c = create_persistent_handle(
-        f"Channel 3C Global & Definition Alignment Reviewer for `{paper_dir}`: cross-check Abstract/Body vs Supplemental Material, `{paper_dir / 'macros.tex'}`, and `{wf / '03_tex_defs_audit.json'}` to ensure zero undefined symbols, zero leaked internal tags (`Lemma L*`, `Grade N`), and clean proof dependencies.",
-        role="3C Global Alignment",
-        stage_name="cross_verify",
-        read_only=True,
-        tier="heavy",
-    )
-
-    rounds: List[Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]] = []
-    fixed_after_last_review = False
-    for rnd in range(2):
-        res_3a = await run_batched(list(zip(rev_3a, tex_files)), lambda pair: call_persistent_handle(pair[0], f"Round {rnd + 1}: Audit `{pair[1]}` directly against raw authority sources & `{locks_path}`.", issue_schema))
-        res_3b = await run_batched(list(zip(rev_3b, claims)), lambda pair: call_persistent_handle(pair[0], f"Round {rnd + 1}: Independently check claim {json.dumps(pair[1], ensure_ascii=False)} against `{paper_dir}`.", issue_schema))
-        res_3c = await call_persistent_handle(rev_3c, f"Round {rnd + 1}: Global consistency & defs audit across `{paper_dir}`.", issue_schema)
-
-        by_file, blockers = collect_review_round(paper_dir, list(res_3a) + list(res_3b) + [res_3c])
-        rounds.append((by_file, blockers))
-        if not by_file:
-            break
-        # one Fix agent per file, keyed by a normalised paper-relative path (reviewers mix absolute/relative paths)
-        await run_guarded_edit_batches(
-            paper_dir,
-            snapshot_project(paper_dir, paths["snapshots"] / f"verify_round{rnd + 1}"),
-            sorted(by_file),
-            lambda rel: dispatch_agent(
-                f"Apply ONLY verified `auto_fixable` corrections to `{paper_dir / rel}`.\nFixes:\n{json.dumps(by_file[rel], indent=2, ensure_ascii=False)}",
-                schema={"type": "string"},
-                role=f"Fix 3-Way: {Path(rel).name}",
-                stage_name="cross_verify",
-            ),
-        )
-        fixed_after_last_review = rnd == 1
-
-    for slot in rev_3a + rev_3b + [rev_3c]:
-        slot.pop("handle", None)
-
-    # The last review round supersedes earlier ones: its reviewers re-read the fixed files.
-    final_blockers = rounds[-1][1] if rounds else []
-    final_keys = {_blocker_key(b) for b in final_blockers}
-    resolved = [b for r in rounds[:-1] for b in r[1] if _blocker_key(b) not in final_keys]
-    cv_md = ["# Stage 3: 3-Way Cross-Verification Report (v2)", "", f"- **Review rounds**: {len(rounds)}",
-             f"- **Fundamental Mathematical Blockers (last round)**: {len(final_blockers)}",
-             f"- **Blockers reported earlier and resolved by the fixes**: {len(resolved)}", ""]
-    if fixed_after_last_review:
-        cv_md += ["> Fixes were applied after the last review round and have not been re-reviewed; run `--mode verify` again to confirm them.", ""]
-    if final_blockers:
-        cv_md += ["## IMPORTANT: Fundamental Blockers Requiring Author Review", ""]
-        for b in final_blockers:
-            cv_md.append(f"- **File**: `{b.get('file')}` | **Claim**: `{b.get('claim_or_eq')}`\n  - **Diagnostic**: {b.get('diagnostic')}")
-            rel = _paper_rel(paper_dir, b["file"]) if b.get("file") else None  # never write outside the paper
-            cand = paper_dir / rel if rel else None
-            if cand is not None and cand.is_file() and cand.suffix.lower() == ".tex" and cand.name != "macros.tex":
-                marker = f"% [VERIFY-BLOCKER] {str(b.get('claim_or_eq') or 'BLOCKER').strip()}: {str(b.get('diagnostic') or '').replace(chr(10), ' ').strip()}"
-                ex = read_text_safe(cand)
-                if marker not in ex:
-                    cand.write_text(marker + "\n" + ex, encoding="utf-8")
-    else:
-        cv_md.append("The last review round reported zero fundamental blockers.")
-    if resolved:
-        cv_md += ["", "## Resolved During This Run", ""] + [f"- `{b.get('file')}`: {b.get('claim_or_eq')}" for b in resolved]
-    (audit_dir / "01_cross_verification.md").write_text("\n".join(cv_md) + "\n", encoding="utf-8")
-    return {"blockers": len(final_blockers), "resolved": len(resolved), "rounds": len(rounds), "report": str(audit_dir / "01_cross_verification.md")}
-
-
-def _blocker_key(b: Dict[str, Any]) -> Tuple[str, str]:
-    return (str(b.get("file") or ""), re.sub(r"\s+", " ", str(b.get("claim_or_eq") or "")).strip().lower())
-
-
-def collect_review_round(paper_dir: Path, reports: List[Any]) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]:
-    """Group one round's auto-fixes by paper-relative file and collect its blockers (paths normalised)."""
-    by_file: Dict[str, List[Dict[str, Any]]] = {}
-    blockers: List[Dict[str, Any]] = []
-    for rep in reports:
-        if not isinstance(rep, dict):
-            raise RuntimeError(f"Stage 3 reviewer returned a non-object result: {str(rep)[:300]}")
-        for b in rep.get("fundamental_blockers", []) or []:
-            if isinstance(b, dict):
-                rel = _paper_rel(paper_dir, b["file"]) if b.get("file") else None
-                blockers.append({**b, "file": rel if rel is not None else b.get("file")})
-        for fx in rep.get("auto_fixable", []) or []:
-            if not isinstance(fx, dict) or not fx.get("file"):
-                continue
-            rel = _paper_rel(paper_dir, fx["file"])
-            if rel is None:
-                log(f"[verify] ignored an auto-fix for a file outside the paper directory: {fx.get('file')}")
-                continue
-            by_file.setdefault(rel, []).append({**fx, "file": rel})
-    seen = set()
-    unique = []
-    for b in blockers:
-        k = _blocker_key(b)
-        if k not in seen:
-            seen.add(k)
-            unique.append(b)
-    return by_file, unique
-
-
-# ==============================================================================
-# Stage 4: Dual DOI+eprint+.bbl Citations & Lock-Retried Claim Fidelity
-# ==============================================================================
-
-async def run_citations(paths: Dict[str, Path]) -> Dict[str, Any]:
-    paper_dir = paths["paper"]
-    wf = paths["wf"]
-    audit_dir = paths["audit"]
     refs_bib = paper_dir / "refs.bib"
     sync_bib = _wf_args().get("sync_bib")
     if sync_bib and Path(str(sync_bib)).exists():
         write_user_file(refs_bib, Path(str(sync_bib)).read_bytes())
     elif not refs_bib.exists():
         refs_bib.write_text("", encoding="utf-8")
-
-    phase("Stage 4: Dual DOI+arXiv+.bbl Citation Audit & Claim Fidelity")
     bib_cache = wf / "04_api_bib_cache.json"
     cite_json = wf / "04_citation_audit.json"
-    cite_md = audit_dir / "02_citation_audit.md"
-
-    _, _, _, audit_p1 = run_tool(
-        "verify_citations.py",
-        ["audit", "--tex-dir", str(paper_dir), "--bib", str(refs_bib), "--cache", str(bib_cache), "--fix-braces", "--upgrade-preprints", "--json-out", str(cite_json), "--md-out", str(cite_md)],
-        allow_fail=True,
-    )
-
-    todo_list = (audit_p1 or {}).get("todo_placeholders", [])
-    newly_added_refs: List[Dict[str, Any]] = []
+    cite_md = paths["audit"] / "02_citation_audit.md"
+    audit_cli = ["audit", "--tex-dir", str(paper_dir), "--bib", str(refs_bib), "--cache", str(bib_cache), "--json-out", str(cite_json), "--md-out", str(cite_md)]
+    _, _, _, rep = run_tool("verify_citations.py", audit_cli + ["--fix-braces", "--upgrade-preprints"], allow_fail=True)
+    if rep is None:
+        return None
+    vc = f"{resolve_python_exe()} {TOOLS_DIR / 'verify_citations.py'} verify-entry"
+    todo_list = rep.get("todo_placeholders") or []
     if todo_list:
-        vc = f"{resolve_python_exe()} {TOOLS_DIR / 'verify_citations.py'} verify-entry"
-        resolved = await run_batched(
+        await run_batched(
             todo_list,
             lambda td: dispatch_agent(
                 f"Resolve the placeholder citation `{td['key']}` at {td['locations']} inside `{paper_dir}`.\n"
                 f"1. `{vc} --query \"...\"` lists candidates only (never verified).\n"
                 f"2. Confirm the right one with `{vc} --doi <doi> --title \"<exact title>\"` (or `--arxiv <id>`).\n"
-                f"3. ONLY if step 2 printed verified=true: add its BibTeX to `{refs_bib}` (keep the file's other entries, @string and comments untouched) "
-                f"and replace the placeholder key in the .tex. Otherwise leave the placeholder and report resolved=false.",
-                schema={"type": "object", "properties": {"placeholder": {"type": "string"}, "resolved": {"type": "boolean"}, "new_key": {"type": "string"}, "title_and_id": {"type": "string"}}, "required": ["placeholder", "resolved"]},
+                f"3. ONLY if step 2 printed verified=true: add its BibTeX to `{refs_bib}` (keep the other entries, @string and comments untouched) "
+                f"and replace the placeholder key in the .tex. Otherwise leave the placeholder and report resolved=false. Change no other text.",
+                schema={"type": "object", "properties": {"placeholder": {"type": "string"}, "resolved": {"type": "boolean"}, "new_key": {"type": "string"}}, "required": ["placeholder", "resolved"]},
                 role=f"Resolve {td['key'][:26]}",
-                stage_name="citation_check",
+                stage_name="check",
             ),
         )
-        newly_added_refs = [r for r in resolved if isinstance(r, dict) and r.get("resolved")]
-
-    if audit_p1 is None:
-        raise RuntimeError("verify_citations.py audit produced no JSON report (see its stderr); citations stage stopped")
-    if audit_p1.get("network_unverified_keys"):
-        log(f"Stage 4: {len(audit_p1['network_unverified_keys'])} cited entries could not be checked (network); the citation gate stays FAILED until a run can reach the APIs")
-    bad_bib = [e for e in audit_p1.get("entries", []) if e.get("is_cited") and e.get("status") in ("EPRINT_DOI_MISMATCH", "EPRINT_NOT_FOUND", "AUTHOR_ORDER_MISMATCH", "IDENTIFIER_NOT_FOUND", "METADATA_MISMATCH", "UNVERIFIED_NO_MATCH")]
-    bbl_iss = audit_p1.get("bbl_issues", []) + audit_p1.get("bib_hygiene_issues", []) + [{"bib_parse_error": pe} for pe in audit_p1.get("bib_parse_errors", [])]
+    bad_bib = [e for e in rep.get("entries", []) if e.get("is_cited") and e.get("status") in _BAD_BIB_STATUSES]
+    bbl_iss = rep.get("bbl_issues", []) + rep.get("bib_hygiene_issues", []) + [{"bib_parse_error": pe} for pe in rep.get("bib_parse_errors", [])]
     if bad_bib or bbl_iss:
         await dispatch_agent(
-            f"Repair ALL BibTeX metadata, eprint/DOI mismatches, duplicate `arXiv:` notes, and math brace issues inside `{refs_bib}` (verify fixes via `verify_citations.py verify-entry`).\n"
-            f"Bad entries:\n{json.dumps(bad_bib, indent=2, ensure_ascii=False)[:3500]}\nHygiene & .bbl issues:\n{json.dumps(bbl_iss, indent=2, ensure_ascii=False)[:2500]}",
+            f"Repair the BibTeX metadata in `{refs_bib}`: eprint/DOI mismatches, duplicate `arXiv:` notes and math braces (check each fix with "
+            f"`{vc}`). Edit only `{refs_bib}`.\nBad entries:\n{json.dumps(bad_bib, indent=2, ensure_ascii=False)}\n"
+            f"Hygiene and .bbl issues:\n{json.dumps(bbl_iss, indent=2, ensure_ascii=False)}",
             schema={"type": "string"},
             role="Repair refs.bib Metadata",
-            stage_name="citation_check",
+            stage_name="check",
         )
-
-    snapshot_project(paper_dir, paths["pre_claim"])
-    rel_files = [str(f.relative_to(paper_dir)).replace("\\", "/") for f in list_editable_tex(paper_dir)]
-    await run_guarded_edit_batches(
-        paper_dir,
-        paths["pre_claim"],
-        rel_files,
-        lambda rel: _edit_with_math_lock_retry(
-            rel,
-            paper_dir,
-            paths["pre_claim"],
-            lambda attempt, fb: (
-                f"Audit citation claim fidelity in `{paper_dir / rel}` against `{bib_cache}` and `{refs_bib}` (Attempt {attempt}).\n"
-                f"Only edit if a claim misattributes or overclaims a reference (e.g. conflating author contributions).\n"
-                f"GUARDRAILS: You may adjust `\\cite{{...}}` keys, NEVER alter `$...$`, `\\label`, `\\ref`, `\\eqref`, `\\extref`, `\\status`, or logical quantifiers in abstract/theorems.\n"
-                + (f"\nPREVIOUS LOCK VIOLATION TO AVOID:\n{fb}" if fb else "")
-            ),
-            role=f"Claim Fidelity: {Path(rel).name}",
-            stage_name="citation_check",
-            extra_check_args=["--allow-cite-changes", "--check-quantifiers"],
-        ),
-    )
-
-    run_tool(
-        "verify_citations.py",
-        ["audit", "--tex-dir", str(paper_dir), "--bib", str(refs_bib), "--cache", str(bib_cache), "--json-out", str(cite_json), "--md-out", str(cite_md)],
-        allow_fail=True,
-    )
-    if newly_added_refs:
-        old_md = read_text_safe(cite_md)
-        prep = "\n".join(f"- `{nr.get('new_key')}`: {nr.get('title_and_id', '')}" for nr in newly_added_refs)
-        cite_md.write_text(f"## Newly Verified Citations\n\n{prep}\n\n{old_md}", encoding="utf-8")
-    return {"citation_md": str(cite_md), "citation_json": str(cite_json)}
+    if todo_list or bad_bib or bbl_iss:
+        _, _, _, rep = run_tool("verify_citations.py", audit_cli, allow_fail=True)
+    return rep
 
 
-# ==============================================================================
-# Stage 5: Deterministic Hygiene, Vetted Connectors & Precision Copy-Edit
-# ==============================================================================
+def _scripted_check_guarded(prompt: str, role: str) -> Any:
+    """A checker that may write scripts (under .workflow/verify_scripts) but must not change the manuscript."""
+    async def _go() -> Any:
+        snap = _readonly_snapshot()
+        try:
+            return await dispatch_agent(prompt, schema=ISSUE_SCHEMA, role=role, stage_name="check", tier="builder")
+        finally:
+            _readonly_restore(snap, role)
+    return _go()
 
-async def run_hygiene(paths: Dict[str, Path]) -> Dict[str, Any]:
+
+def _pick_numeric_claims(ledger_path: Path, plan: Optional[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    claims = _ledger_claims(ledger_path)
+    core = [c for c in claims if str(c.get("tier") or "").lower() == "core"]
+    if not core and plan:
+        main_ids = {str(i) for b in plan["blocks"] if b.get("part") == "main" for i in (b.get("claim_ids") or [])}
+        core = [c for c in claims if str(c.get("id")) in main_ids]
+    core = core or claims
+    if len(core) > limit:
+        log(f"[check] {len(core)} core results; scripted checks run on the first {limit} (raise max_numeric_checks to check more)")
+    return core[:limit]
+
+
+async def run_check(paths: Dict[str, Path]) -> Dict[str, Any]:
     paper_dir = paths["paper"]
     wf = paths["wf"]
     audit_dir = paths["audit"]
-    profile_path = ensure_default_profile(paths)
-    rules_txt = read_text_safe(REFS_DIR / "humanizer_physics_rules.md")
+    args = _wf_args()
+    genre = str(args.get("genre") or "long")
+    ledger_path = wf / "00_ground_truth_ledger.json"
+    plan, _ = validate_plan(_plan_path())
+    main_tex = paper_dir / "main.tex"
+    auth_files = [str(p) for p in collect_source_files(args.get("authority_paths") or args.get("source_paths") or [])]
+    phase("Stage 3: Check (reports issues; the author fixes them in revise)")
 
-    phase("Stage 5: Positive-ROI Watermark Hygiene, Copy-Edit & Anti-Staccato Audit (v2)")
-    # Deterministic fixes first, then the snapshot: if a copy-edit agent breaks the math lock, restoring
-    # the snapshot must not also undo the watermark/typography clean-up.
-    run_tool("clean_watermarks.py", ["--paths", str(paper_dir), "--profile", str(profile_path), "--fix", "--json-out", str(wf / "05_clean_wm.json")], allow_fail=True)
-    snapshot_project(paper_dir, paths["pre_polish"])
+    defs_cli = ["--main", str(main_tex), "--json-out", str(wf / "03_tex_defs_audit.json"), "--md-out", str(audit_dir / "00_tex_defs_audit.md")]
+    if ABSTRACT_LIMITS.get(genre):
+        defs_cli += ["--abstract-max-chars", str(ABSTRACT_LIMITS[genre])]
+    _, _, _, defs = run_tool("audit_tex_defs.py", defs_cli, allow_fail=True)
+    issues: List[Dict[str, Any]] = issues_from_defs(paper_dir, defs)
+    issues += issues_from_citations(paper_dir, await citation_pass(paths))
+    tex_files = list_editable_tex(paper_dir)
+    _, _, _, wm = run_tool("clean_watermarks.py", ["--paths", str(paper_dir), "--json-out", str(wf / "05_clean_wm.json")], allow_fail=True)
+    sty = None
+    if tex_files:
+        _, _, _, sty = run_tool("style_metrics.py", ["verify", "--inputs", *[str(f) for f in tex_files], "--profile", str(ensure_default_profile(paths)),
+                                                     "--json-out", str(wf / "05_stylometrics.json"), "--md-out", str(audit_dir / "03_stylometrics_report.md"), "--no-lm"], allow_fail=True)
+    issues += issues_from_scans(paper_dir, wm, sty)
 
-    stylo_json = wf / "05_stylometrics.json"
-    stylo_md = audit_dir / "03_stylometrics_report.md"
-    files_now = [str(f) for f in list_editable_tex(paper_dir)]
-    _, _, _, sty_res = run_tool(
-        "style_metrics.py",
-        ["verify", "--inputs", *files_now, "--profile", str(profile_path), "--json-out", str(stylo_json), "--md-out", str(stylo_md), "--no-lm"],
-        allow_fail=True,
+    truth = (f"the ledger `{ledger_path}` and the original notes and authority files {auth_files}. Do not use `01_story.md`, `01_plan.json` "
+             f"or the old `01_blueprint.json` as evidence")
+    rels = [str(f.relative_to(paper_dir)).replace("\\", "/") for f in tex_files]
+    scope_reports = await run_batched(
+        rels,
+        lambda rel: dispatch_agent(
+            f"Check `{paper_dir / rel}` against {truth}.\n"
+            f"Report every place where the text (a) states a result with a wider scope, or weaker or stronger hypotheses or quantifiers, than "
+            f"the source; (b) attributes something to the wrong work or misdescribes a cited work (metadata and abstracts of cited works: "
+            f"`{wf / '04_api_bib_cache.json'}`); (c) gives a number that differs from the source or attaches it to the wrong model or observable; "
+            f"(d) contains a mathematical error. Report nothing about style or wording. In the abstract and the introduction a result may be "
+            f"told in words with its technical hypotheses left to the body: report only what is false or stronger than the source there, "
+            f"not a missing qualifier.\n{ISSUE_FORMAT}",
+            schema=ISSUE_SCHEMA,
+            role=f"Check {Path(rel).name}",
+            stage_name="check",
+            read_only=True,
+            tier="heavy",
+        ),
+    )
+    for rel, rep in zip(rels, scope_reports):
+        issues += collect_issues(paper_dir, [rep], f"scope:{rel}")
+
+    max_checks = args.get("max_numeric_checks")
+    numeric_claims = _pick_numeric_claims(ledger_path, plan, 12 if max_checks is None else int(max_checks))  # 0 = none
+    numeric_reports = await run_batched(
+        numeric_claims,
+        lambda c: _scripted_check_guarded(
+            f"Independently check this ledger result as the manuscript in `{paper_dir}` states it:\n{json.dumps(c, ensure_ascii=False)}\n"
+            f"Write and run a standalone script with `{resolve_python_exe()}` in `{paths['verify_scripts']}` that tests the identity or number "
+            f"and its boundary cases. Do not edit manuscript files. Report an issue only where the manuscript's statement fails your check, "
+            f"and cite the script as evidence.\n{ISSUE_FORMAT}",
+            f"Numeric {c.get('id', '?')}",
+        ),
+    )
+    for c, rep in zip(numeric_claims, numeric_reports):
+        issues += collect_issues(paper_dir, [rep], f"numeric:{c.get('id', '?')}")
+
+    intro = next((b["file"] for b in (plan or {}).get("blocks", []) if b.get("part") == "main"), None)
+    intro_txt = f" and the introduction `{paper_dir / intro}`" if intro else " and its introduction (the first main-text section it inputs)"
+    math_txt = f" The abstract uses these math expressions: {json.dumps((defs or {}).get('abstract_math') or [], ensure_ascii=False)}." if (defs or {}).get("abstract_math") else ""
+    reader = await dispatch_agent(
+        f"Read the abstract in `{main_tex}`{intro_txt} as a physicist from a neighbouring field would.{math_txt}\n"
+        f"Report: (1) every sentence of the abstract or the introduction that is false or claims more than the results support (compare "
+        f"with the ledger `{ledger_path}`), severity high. These parts tell results in words and leave technical hypotheses (system size, "
+        f"boundary conditions, parameter ranges) to the body; a missing qualifier is not an issue unless the sentence is false without it. "
+        f"(2) every symbol or acronym in the abstract that the abstract itself does not explain, "
+        f"severity medium; (3) one issue for each of these questions the introduction leaves unanswered, severity medium: what is the "
+        f"question, why does it matter, how far did earlier work get, what is new here.\n{ISSUE_FORMAT}",
+        schema=ISSUE_SCHEMA,
+        role="Reader Check",
+        stage_name="check",
+        read_only=True,
+        tier="heavy",
+    )
+    issues += collect_issues(paper_dir, [reader], "reader")
+
+    issues = dedupe_issues(issues)
+    counts = {s: sum(1 for i in issues if i["severity"] == s) for s in SEVERITIES}
+    issues_path = wf / "03_issues.json"
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    issues_path.write_text(json.dumps({"generated": stamp, "counts": counts, "issues": issues}, indent=2, ensure_ascii=False), encoding="utf-8")
+    md = ["# Check Report", "", f"- Generated: {stamp}", f"- Issues: {len(issues)} (high {counts['high']}, medium {counts['medium']}, low {counts['low']})",
+          "- Nothing was rewritten here; `mode=revise` hands these issues to the author.", ""]
+    by_file: Dict[str, List[Dict[str, Any]]] = {}
+    for it in issues:
+        by_file.setdefault(it.get("file") or "(no file)", []).append(it)
+    for f, items in by_file.items():
+        md += [f"## {f}", ""]
+        for it in items:
+            quote = f" \u2014 \"{str(it['quote'])[:160]}\"" if it.get("quote") else ""
+            md.append(f"- **{it['severity']}** [{it.get('source', '')}] {it.get('location', '')}{quote}: {it['problem']}")
+        md.append("")
+    report = audit_dir / "01_check_report.md"
+    report.write_text("\n".join(md), encoding="utf-8")
+    log(f"Check: {len(issues)} issues (high {counts['high']}, medium {counts['medium']}, low {counts['low']}) -> {report}")
+    return {"issues": len(issues), **counts, "issues_json": str(issues_path), "report": str(report)}
+
+
+# ------------------------------------------------------------------------------
+# Stage 4: revise (the author fixes reported issues; `repair` is an alias)
+# ------------------------------------------------------------------------------
+
+REPAIR_INLINE_CHARS = 12000
+REVISE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "fixed": {"type": "array", "items": {"type": "string"}},
+        "declined": {"type": "array", "items": {"type": "object", "properties": {"issue": {"type": "string"}, "reason": {"type": "string"}}, "required": ["issue", "reason"]}},
+    },
+    "required": ["fixed", "declined"],
+}
+
+
+def _is_existing_file(s: str) -> bool:
+    """`repair_instructions` may be a path or the instructions themselves; long text is not a path
+    (and on Linux Path(long_text).is_file() raises ENAMETOOLONG instead of returning False)."""
+    if "\n" in s or len(s) > 1024:
+        return False
+    try:
+        return Path(s).is_file()
+    except (OSError, ValueError):
+        return False
+
+
+def _paper_rel(paper_dir: Path, raw: Any) -> Optional[str]:
+    """Normalise a file reference (relative to paper_dir, './x', or absolute) to a paper-relative path; None if outside."""
+    p = Path(str(raw).strip().replace("\\", "/"))
+    cand = p if p.is_absolute() else paper_dir / p
+    try:
+        return str(cand.resolve().relative_to(paper_dir.resolve())).replace("\\", "/")
+    except ValueError:
+        return None
+
+
+def main_part_files(paper_dir: Path) -> List[str]:
+    """main.tex's own inputs in reading order, then main.tex itself (it holds the abstract, revised last)."""
+    main = paper_dir / "main.tex"
+    if not main.exists():
+        return []
+    out: List[str] = []
+    for line in read_text_safe(main).splitlines():
+        code = re.split(r"(?<!\\)%", line, maxsplit=1)[0]
+        for m in re.finditer(r"\\(?:input|include)\s*\{([^}]+)\}", code):
+            name = m.group(1).strip()
+            rel = name if name.lower().endswith(".tex") else name + ".tex"
+            norm = _paper_rel(paper_dir, rel)
+            if norm and not _is_skipped_generated_tex(Path(norm)) and (paper_dir / norm).exists() and norm not in out:
+                out.append(norm)
+    return out + ["main.tex"]
+
+
+def _revise_prompt(paper_dir: Path, rel: str, items: List[Dict[str, Any]], story_path: Path, inst_path: Optional[Path], inst_len: int,
+                   genre: str = "long") -> str:
+    lines: List[str] = []
+    for k, it in enumerate(items, 1):
+        if "issues_to_fix" in it:  # routed from free-form instructions by the planner
+            ref = f"  [see instructions: {it['instruction_refs']}]" if it.get("instruction_refs") else ""
+            lines.append(f"{k}. {it['issues_to_fix']}{ref}")
+            continue
+        parts = [f"{k}. [{it.get('severity', 'medium')}] {it.get('location', '')}: {it.get('problem', '')}"]
+        if it.get("quote"):
+            parts.append(f"text: \"{it['quote']}\"")
+        if it.get("evidence"):
+            parts.append(f"evidence: {it['evidence']}")
+        if it.get("suggested_fix"):
+            parts.append(f"suggestion: {it['suggested_fix']}")
+        lines.append(" | ".join(parts))
+    story = f"The paper's story is in `{story_path}`; keep it intact.\n" if story_path.exists() else ""
+    inst = (f"The full instructions are in `{inst_path}` ({inst_len} characters). Read the parts that concern this file there; text that must be "
+            f"inserted or replaced verbatim (acknowledgments, abstract wording, quoted sentences, equations) must be copied exactly from that file, "
+            f"never reconstructed from the summary below, and do not search other folders for it.\n") if inst_path else ""
+    limit = ABSTRACT_LIMITS.get(genre)
+    abstract_rule = (
+        "In the abstract and the introduction, fix an overclaim by rewording the sentence or dropping the claim, never by adding "
+        "qualifiers or hypotheses: those belong in the theorem statement or the Supplemental Material"
+        + (f", and the abstract must stay within {limit} characters including spaces. " if limit else ". ")
+    )
+    return (
+        f"Revise `{paper_dir / rel}`. You own this text.\n{story}{inst}"
+        "Issues for this file (low severity = optional):\n" + "\n".join(lines) + "\n"
+        "Fix each issue with the smallest edit that makes the text right, and keep the story and the flow. " + abstract_rule +
+        "If an issue is mistaken, or its text is not in this file, leave the text and say why. "
+        f"Keep the macros in `{paper_dir / 'macros.tex'}`. Edit only this file. Reply with what you fixed and what you declined (with reasons)."
     )
 
-    _, _, _, wm_scan = run_tool("clean_watermarks.py", ["--paths", str(paper_dir), "--profile", str(profile_path), "--json-out", str(wf / "05_clean_wm.json")], allow_fail=True)
-    wm_by_file = {item["file"]: item for item in (wm_scan or {}).get("files", [])}
-    sty_by_file = {item["file"]: item for item in (sty_res or {}).get("files", [])}
 
-    flagged_rels: List[str] = []
-    for f in list_editable_tex(paper_dir):
-        key_p = str(f).replace("\\", "/")
-        wi = wm_by_file.get(key_p, {})
-        si = sty_by_file.get(key_p, {})
-        if wi.get("ai_slop_hits") or wi.get("copyedit_issues") or wi.get("rhetorical_hints") or si.get("staccato_warning"):
-            flagged_rels.append(str(f.relative_to(paper_dir)).replace("\\", "/"))
+async def run_revise(paths: Dict[str, Path], build_after: bool = True, prefer_referee: bool = False) -> Dict[str, Any]:
+    paper_dir = paths["paper"]
+    wf = paths["wf"]
+    audit_dir = paths["audit"]
+    args = _wf_args()
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    snap_dir = snapshot_project(paper_dir, paths["snapshots"] / f"{ts}_pre_revise")
+    phase(f"Revise: the author fixes the reported issues (checkpoint {snap_dir.name})")
+    if args.get("sync_bib") and Path(str(args["sync_bib"])).exists():
+        write_user_file(paper_dir / "refs.bib", Path(str(args["sync_bib"])).read_bytes())
 
-    if flagged_rels:
-        log(f"Targeted Copy-Edit triggered ONLY on flagged files: {flagged_rels}")
-        await run_guarded_edit_batches(
-            paper_dir,
-            paths["pre_polish"],
-            flagged_rels,
-            lambda rel: _edit_with_math_lock_retry(
-                rel,
-                paper_dir,
-                paths["pre_polish"],
-                lambda attempt, fb: (
-                    f"Precision Copy-Edit `{paper_dir / rel}` (Attempt {attempt}).\n"
-                    f"ONLY fix the flagged AI clichés, copy-edit bugs (`rank rank`, `at most <=`, `Sec.` at sentence start, repeated acronym expansions), vetted non-scientific evaluative hype, or choppy `<=8`-word staccato clusters.\n"
-                    f"HARD GUARDRAIL: NEVER touch clean paragraphs, math `$...$`, labels/cites, OR any logical quantifiers/hypotheses in abstract/theorems!\n\n"
-                    f"Findings:\n{json.dumps(wm_by_file.get(str(paper_dir / rel).replace(chr(92), '/'), {}), indent=2, ensure_ascii=False)[:3000]}\n"
-                    f"Staccato warning: {sty_by_file.get(str(paper_dir / rel).replace(chr(92), '/'), {}).get('staccato_warning')}\n"
-                    f"Rules:\n{rules_txt[:2000]}"
-                    + (f"\nPREVIOUS MATH/QUANTIFIER LOCK VIOLATION:\n{fb}" if fb else "")
-                ),
-                role=f"Copy-Edit: {Path(rel).name}",
-                stage_name="hygiene",
-                tier="fast",
-                extra_check_args=["--check-quantifiers"],
-            ),
-        )
-        run_tool("style_metrics.py", ["verify", "--inputs", *[str(f) for f in list_editable_tex(paper_dir)], "--profile", str(profile_path), "--json-out", str(stylo_json), "--md-out", str(stylo_md), "--no-lm"], allow_fail=True)
+    raw_inst_full = str(args.get("repair_instructions") or "")
+    raw_inst = raw_inst_full.strip()
+    issues_path = wf / "03_issues.json"
+    referee = audit_dir / "05_blind_referee_report.md"
+    inst_path: Optional[Path] = None
+    if raw_inst and _is_existing_file(raw_inst):
+        inst_path = Path(raw_inst).resolve()
+    elif raw_inst:
+        # Inline text is saved byte-for-byte, so every worker can read the original rather than a planner's paraphrase.
+        inst_path = wf / f"repair_instructions_{ts}.md"
+        with open(inst_path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(raw_inst_full)
+    elif prefer_referee and referee.exists():
+        inst_path = referee
+    elif not issues_path.exists() and referee.exists():
+        inst_path = referee
+    elif not issues_path.exists():
+        raise RuntimeError("revise: nothing to work from. Run mode=check first, or pass repair_instructions (a report path or the text).")
+
+    by_file: Dict[str, List[Dict[str, Any]]] = {}
+    inst_len = 0
+    skip_plan = False
+    if inst_path is None:
+        data = json.loads(read_text_safe(issues_path) or "{}")
+        for it in data.get("issues", []) if isinstance(data, dict) else []:
+            rel = resolve_paper_file(paper_dir, it.get("file") or "main.tex")
+            if rel:
+                by_file.setdefault(rel, []).append(it)
+        source = str(issues_path)
     else:
-        log("All files already clean on first hygiene pass; 0 LLM prose rewrites needed.")
+        inst_text = read_text_safe(inst_path)
+        if not inst_text.strip():
+            raise RuntimeError(f"revise: instructions file {inst_path} is empty")
+        inst_len = len(inst_text)
+        source = str(inst_path)
+        truncated = inst_len > REPAIR_INLINE_CHARS
+        if truncated:
+            log(f"[revise] instructions are {inst_len} chars; the planner sees the first {REPAIR_INLINE_CHARS} and is told to read the full file {inst_path}")
+        inst_excerpt = inst_text[:REPAIR_INLINE_CHARS] + (
+            f"\n\n[... TRUNCATED here: {inst_len - REPAIR_INLINE_CHARS} more characters. Read the full file `{inst_path}`.]" if truncated else "")
+        explicit = [_paper_rel(paper_dir, x) for x in (args.get("repair_files") or [])]
+        if any(t is None for t in explicit):
+            raise RuntimeError(f"repair_files must point inside {paper_dir}: {args.get('repair_files')}")
+        explicit_s = [t for t in explicit if t]
+        skip_plan = bool(args.get("repair_skip_plan")) or len(explicit_s) == 1
+        if args.get("repair_skip_plan") and not explicit_s:
+            raise RuntimeError("repair_skip_plan=true needs repair_files (the files to hand the full instructions to)")
+        if skip_plan:
+            log(f"[revise] planner skipped; each of {explicit_s} receives the full instructions")
+            for rel in explicit_s:
+                by_file[rel] = [{"issues_to_fix": "Apply every instruction in the instructions file that concerns this file.", "instruction_refs": "(whole file)"}]
+        else:
+            plan_res = await dispatch_agent(
+                f"Route the revision instructions in `{inst_path}` ({inst_len} characters{'; the excerpt below is TRUNCATED, read the whole file' if truncated else ''}) "
+                f"to the files of the paper in `{paper_dir}` (`macros.tex`, `refs.bib`, `sections/`, `main.tex`, `supplement.tex`).\n"
+                f"Return per-file work items: `target_file` (relative to `{paper_dir}`), `issues_to_fix` (what to change) and `instruction_refs` "
+                f"(where in the instructions each fix is specified: heading, quoted first words, or line numbers). NEVER paraphrase text that must "
+                f"be inserted or replaced verbatim; point to it in `instruction_refs`.\n"
+                f"Explicit target filter (if non-empty, plan only these files): {explicit_s}\n\nInstructions (excerpt):\n{inst_excerpt}",
+                schema={
+                    "type": "object",
+                    "properties": {"work_items": {"type": "array", "items": {"type": "object", "properties": {
+                        "target_file": {"type": "string"}, "issues_to_fix": {"type": "string"}, "instruction_refs": {"type": "string"}},
+                        "required": ["target_file", "issues_to_fix"]}}},
+                    "required": ["work_items"],
+                },
+                role="Plan Revisions",
+                stage_name="revise",
+                tier="heavy",
+            )
+            if not isinstance(plan_res, dict):
+                raise RuntimeError(f"Revision planner returned a non-object result: {str(plan_res)[:300]}")
+            for it in plan_res.get("work_items", []):
+                if not isinstance(it, dict) or not it.get("target_file"):
+                    continue
+                rel = resolve_paper_file(paper_dir, str(it["target_file"]))
+                if rel is None:
+                    log(f"[revise] skipped work item outside the paper directory: {it.get('target_file')}")
+                    continue
+                if explicit_s and rel not in explicit_s:
+                    log(f"[revise] skipped work item for {rel}: not in repair_files")
+                    continue
+                by_file.setdefault(rel, []).append({"issues_to_fix": str(it.get("issues_to_fix", "")), "instruction_refs": str(it.get("instruction_refs", ""))})
 
-    run_tool("audit_tex_defs.py", ["--main", str(paper_dir / "main.tex"), "--json-out", str(wf / "05_tex_defs_audit.json")], allow_fail=True)
-    return {"stylometrics_report": str(stylo_md), "clean_wm_json": str(wf / "05_clean_wm.json")}
+    story_path = wf / "01_story.md"
+    main_order = main_part_files(paper_dir)
+    seq = [r for r in main_order if r in by_file]  # main text: one file at a time, in reading order, abstract last
+    par = [r for r in sorted(by_file) if r not in main_order]  # SM, macros, refs.bib: in parallel batches
+
+    def worker(rel: str) -> Any:
+        return dispatch_agent(_revise_prompt(paper_dir, rel, by_file[rel], story_path, inst_path, inst_len, str(args.get("genre") or "long")),
+                              schema=REVISE_SCHEMA, role=f"Revise: {Path(rel).name}", stage_name="revise")
+
+    results = dict(zip(par, await run_guarded_edit_batches(paper_dir, snap_dir, par, worker)))
+    results.update(zip(seq, await run_guarded_edit_batches(paper_dir, snap_dir, seq, worker, batch_size=1)))
+
+    # Math changes are reported, not blocked: some issues are wrong formulas that must change.
+    math_changes: Dict[str, Any] = {}
+    for rel in seq + par:
+        before, after = snap_dir / rel, paper_dir / rel
+        if rel.endswith(".tex") and before.exists() and after.exists() and before.read_bytes() != after.read_bytes():
+            rc, _, _, chk = run_tool("check_math_integrity.py", ["--before", str(before), "--after", str(after), "--allow-cite-changes"], allow_fail=True)
+            if rc != 0 and chk:
+                math_changes[rel] = {k: chk.get(k) for k in ("mismatches_count", "quantifier_mismatches_count", "prose_lock_mismatches_count")}
+
+    lines = [f"# Revise Report ({ts})", "", f"- **Checkpoint**: `{snap_dir}`", f"- **Worked from**: `{source}`{' (planner skipped)' if skip_plan else ''}", ""]
+    declined_total = 0
+    for rel in seq + par:
+        r = results.get(rel)
+        lines += [f"## {rel}", ""]
+        if isinstance(r, dict):
+            lines += [f"- fixed: {x}" for x in r.get("fixed") or []]
+            for d in r.get("declined") or []:
+                declined_total += 1
+                lines.append(f"- declined: {d.get('issue', '') if isinstance(d, dict) else d} \u2014 {d.get('reason', '') if isinstance(d, dict) else ''}")
+        else:
+            lines.append(f"- {str(r)[:400]}")
+        if rel in math_changes:
+            lines.append(f"- math changed (review it): {math_changes[rel]}")
+        lines.append("")
+    report = audit_dir / "06_revise_report.md"
+    report.write_text("\n".join(lines), encoding="utf-8")
+    out: Dict[str, Any] = {"checkpoint": str(snap_dir), "instructions": source, "planner_skipped": skip_plan, "revised_count": len(seq) + len(par),
+                           "declined": declined_total, "math_changed_files": sorted(math_changes), "report": str(report)}
+    if build_after:
+        run_tool("audit_tex_defs.py", ["--main", str(paper_dir / "main.tex"), "--json-out", str(wf / "06_revise_tex_defs.json"), "--md-out", str(audit_dir / "00_tex_defs_audit.md")], allow_fail=True)
+        out.update(await run_build(paths))
+    return out
 
 
-# ==============================================================================
-# Build & Sanitized arXiv Package Stage
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Clean-up and build (deterministic; the only LLM call fixes compile errors)
+# ------------------------------------------------------------------------------
+
+def run_cleanup_tools(paths: Dict[str, Path]) -> Dict[str, Any]:
+    """Invisible characters, typography, copy-edit slips. No profile is passed, so no connector is ever swapped."""
+    _, _, _, wm = run_tool("clean_watermarks.py", ["--paths", str(paths["paper"]), "--fix", "--json-out", str(paths["wf"] / "05_clean_wm.json")], allow_fail=True)
+    return wm or {}
+
+
+async def run_cleanup(paths: Dict[str, Path]) -> Dict[str, Any]:
+    phase("Clean-up (deterministic only; v3 has no LLM polishing)")
+    run_cleanup_tools(paths)
+    files = [str(f) for f in list_editable_tex(paths["paper"])]
+    stylo_md = paths["audit"] / "03_stylometrics_report.md"
+    if files:
+        run_tool("style_metrics.py", ["verify", "--inputs", *files, "--profile", str(ensure_default_profile(paths)), "--json-out",
+                                      str(paths["wf"] / "05_stylometrics.json"), "--md-out", str(stylo_md), "--no-lm"], allow_fail=True)
+    return {"clean_wm_json": str(paths["wf"] / "05_clean_wm.json"), "stylometrics_report": str(stylo_md)}
+
 
 async def run_build(paths: Dict[str, Path]) -> Dict[str, Any]:
     paper_dir = paths["paper"]
@@ -2087,7 +2615,9 @@ async def run_build(paths: Dict[str, Path]) -> Dict[str, Any]:
     flat_supp = paths["submission"] / "supplement_arxiv.tex"
     build_json = wf / "05_build_report.json"
 
-    phase("TeX Dual Build, Layout Hygiene & Sanitized arXiv Flattening")
+    phase("Clean-up, TeX Dual Build, Layout Check and Sanitized arXiv Flattening")
+    run_cleanup_tools(paths)
+    clean, missing = False, []
     for attempt in range(3):
         cli = ["--main", str(main_tex), "--compile", "--flatten-out", str(flat_main), "--inline-bbl", "--json-out", str(build_json)]
         if supp_tex and supp_tex.exists():
@@ -2097,27 +2627,53 @@ async def run_build(paths: Dict[str, Path]) -> Dict[str, Any]:
         scr = (bld or {}).get("supplement_compile_result", {})
         lc = (bld or {}).get("layout_check", {})
         leaks = (bld or {}).get("submission_leaks", []) + (bld or {}).get("supplement_submission_leaks", [])
-        clean = (
-            rc == 0
-            and cr.get("clean_pass")
-            and (not scr or scr.get("clean_pass"))
+        missing, other_errors = missing_tex_files(cr, scr)
+        rest_clean = (
+            not other_errors
             and not lc.get("layout_issues")
             and not leaks
             and not cr.get("overfull_gt10pt")
             and not (scr and scr.get("overfull_gt10pt"))
         )
-        if clean or attempt == 2:
-            log(f"Build finished (attempt {attempt + 1}): clean={clean}, leaks={len(leaks)}, layout_issues={len(lc.get('layout_issues', []))}")
+        clean = bool(rc == 0 and cr.get("clean_pass") and (not scr or scr.get("clean_pass")) and rest_clean)
+        if missing:
+            log(f"[build] missing files {missing}: figures come from mode=figures (which also checks them); the compile fixer never makes them")
+        if clean or attempt == 2 or (missing and rest_clean):
+            log(f"Build finished (attempt {attempt + 1}): clean={clean}, missing={len(missing)}, leaks={len(leaks)}, layout_issues={len(lc.get('layout_issues', []))}")
             break
+        fig_before = set(paths["figures"].rglob("*")) if paths["figures"].exists() else set()
         await dispatch_agent(
-            f"Fix TeX compilation, layout (e.g. `\\letterhead` missing `\\par`, orphan page, >10pt overfull, hyperref `\\texorpdfstring`), or arXiv submission leaks (e.g. placeholder authors, missing Acknowledgments/Data Availability) in `{paper_dir}` without altering equations.\n"
-            f"Diagnostics:\n{json.dumps(bld, indent=2, ensure_ascii=False)[:4000]}",
+            f"Fix TeX compilation, layout (e.g. `\\letterhead` missing `\\par`, orphan page, >10pt overfull, hyperref `\\texorpdfstring`), or arXiv "
+            f"submission leaks in `{paper_dir}` without altering equations or the wording of the prose. Placeholders meant for the human author "
+            f"(author list, acknowledgments) stay as they are. Never create, regenerate or edit figure files or figure scripts: a missing figure "
+            f"is made by the figures stage, which also checks it, so leave those errors in place"
+            + (f" (missing now: {missing})" if missing else "") + f".\nDiagnostics:\n{json.dumps(bld, indent=2, ensure_ascii=False)}",
             schema={"type": "string"},
             role=f"Build/Layout Fix #{attempt + 1}",
             stage_name="compile_fix",
             tier="fast",
         )
-    return {"build_json": str(build_json), "main_arxiv": str(flat_main)}
+        for f in sorted(set(paths["figures"].rglob("*")) - fig_before):
+            if f.is_file():  # made by the compile fixer despite the rule: moved aside, never used unchecked
+                dest = wf / "readonly_violations" / f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{f.name}"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(f), str(dest))
+                log(f"[build] the compile fixer created {f.name} in figures/; moved it to {dest} (figures come from mode=figures)")
+    return {"build_json": str(build_json), "main_arxiv": str(flat_main), "clean": clean, "missing_files": missing}
+
+
+def missing_tex_files(*compile_results: Optional[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
+    """Split LaTeX errors into missing input/graphics files and everything else."""
+    missing: set = set()
+    other: List[str] = []
+    for res in compile_results:
+        for err in (res or {}).get("latex_errors") or []:
+            m = re.search(r"File [`']([^'`]+)' not found", str(err))
+            if m:
+                missing.add(m.group(1))
+            else:
+                other.append(str(err))
+    return sorted(missing), other
 
 
 # ==============================================================================
@@ -2144,7 +2700,7 @@ def _build_referee_sandbox(paper_dir: Path, wf: Path, fig_renders: Path, sandbox
     if fig_renders.exists():
         for f in sorted(fig_renders.glob("*.png")):
             _cp(f, f"renders/{f.name}")
-    for name in ("05_tex_defs_audit.json", "04_citation_audit.json", "06_figure_verify.json", "05_build_report.json"):
+    for name in ("05_tex_defs_audit.json", "03_tex_defs_audit.json", "04_citation_audit.json", "06_figure_verify.json", "05_build_report.json"):
         f = wf / name
         if f.exists():
             _cp(f, f"audit/{name}")
@@ -2181,7 +2737,7 @@ async def run_blind_referee(paths: Dict[str, Path]) -> Dict[str, Any]:
         )
         roles = [
             ("Referee A (Specialist)", f"Act as a strict narrow-field specialist Referee for the manuscript in `{sb}`. Audit EVERY theorem hypothesis, quantifier, proof step (`Lemma` completeness, boundary conditions, counterexamples via `{resolve_python_exe()}` scripts you write in `{sb / 'verify_scripts'}`), and numerical claim across main + Supplemental `.tex`. Rank findings strictly into P0/P1/P2/P3 with file:line.\n{isol_rule}"),
-            ("Referee B (Broad Reader)", f"Act as a broad condensed-matter / theoretical-physics Referee reading `{sb / 'main.tex'}`, its `sections/*.tex`, and PNG previews in `{sb / 'renders'}` (do NOT lean on Supplemental Material to rescue missing main-text definitions!). Flag every undefined symbol, missing microscopic formula, math jargon without intuition, staccato prose cluster, and visual clutter.\n{isol_rule}"),
+            ("Referee B (Broad Reader)", f"Act as a broad condensed-matter / theoretical-physics Referee reading `{sb / 'main.tex'}`, its `sections/*.tex`, and PNG previews in `{sb / 'renders'}` (do NOT lean on Supplemental Material to rescue missing main-text definitions). First answer, from the abstract and the introduction alone: what is the question, why does it matter, how far did earlier work get, and what is new here; say plainly where the text does not tell you. Then flag every undefined symbol, missing microscopic formula, math jargon without intuition, choppy prose, and visual clutter.\n{isol_rule}"),
             ("Associate Editor (Format & Policy)", f"Act as Journal Associate Editor inspecting `{sb / 'main.tex'}`, `*.bbl`, `{sb / 'submission'}` and the audit JSONs in `{sb / 'audit'}` (build report, citation audit, figure verification). Check abstract char/page budgets, run-in heading `\\par` breaks, SM `\\cite` formatting, `.bbl` duplicate `arXiv:`/math downcasing, arXiv leak sanitization, and print pt legibility.\n{isol_rule}"),
         ]
         panel_reports = await run_batched(
@@ -2204,170 +2760,7 @@ async def run_blind_referee(paths: Dict[str, Path]) -> Dict[str, Any]:
         + "\n",
         encoding="utf-8",
     )
-    return {"blind_referee_report": str(out_md)}
-
-
-# ==============================================================================
-# On-Demand Repair Phase (Fallback & Modular Patching)
-# ==============================================================================
-
-REPAIR_INLINE_CHARS = 12000
-
-
-def _is_existing_file(s: str) -> bool:
-    """`repair_instructions` may be a path or the instructions themselves; long text is not a path
-    (and on Linux Path(long_text).is_file() raises ENAMETOOLONG instead of returning False)."""
-    if "\n" in s or len(s) > 1024:
-        return False
-    try:
-        return Path(s).is_file()
-    except (OSError, ValueError):
-        return False
-
-
-def _paper_rel(paper_dir: Path, raw: Any) -> Optional[str]:
-    """Normalise a file reference (relative to paper_dir, './x', or absolute) to a paper-relative path; None if outside."""
-    p = Path(str(raw).strip().replace("\\", "/"))
-    cand = p if p.is_absolute() else paper_dir / p
-    try:
-        return str(cand.resolve().relative_to(paper_dir.resolve())).replace("\\", "/")
-    except ValueError:
-        return None
-
-
-async def run_repair(paths: Dict[str, Path]) -> Dict[str, Any]:
-    paper_dir = paths["paper"]
-    wf = paths["wf"]
-    audit_dir = paths["audit"]
-    args = _wf_args()
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    snap_dir = snapshot_project(paper_dir, paths["snapshots"] / f"{ts}_pre_repair")
-
-    phase(f"Repair Fallback Phase (Checkpoint: {snap_dir.name})")
-    if args.get("sync_bib") and Path(str(args["sync_bib"])).exists():
-        write_user_file(paper_dir / "refs.bib", Path(str(args["sync_bib"])).read_bytes())
-
-    # The original instructions always live in a file that every repair agent can read verbatim:
-    # the planner only routes work, it must never be the only carrier of text to be inserted.
-    raw_inst_full = str(args.get("repair_instructions") or "")
-    raw_inst = raw_inst_full.strip()
-    if raw_inst and _is_existing_file(raw_inst):
-        inst_path = Path(raw_inst).resolve()
-    elif raw_inst:
-        inst_path = wf / f"repair_instructions_{ts}.md"
-        with open(inst_path, "w", encoding="utf-8", newline="") as fh:  # byte-for-byte what the user gave
-            fh.write(raw_inst_full)
-    elif (audit_dir / "05_blind_referee_report.md").exists():
-        inst_path = audit_dir / "05_blind_referee_report.md"
-    elif (audit_dir / "01_cross_verification.md").exists():
-        inst_path = audit_dir / "01_cross_verification.md"
-    else:
-        raise RuntimeError("repair: no repair_instructions given and no referee / cross-verification report to repair from")
-    inst_text = read_text_safe(inst_path)
-    if not inst_text.strip():
-        raise RuntimeError(f"repair: instructions file {inst_path} is empty")
-    truncated = len(inst_text) > REPAIR_INLINE_CHARS
-    if truncated:
-        log(f"[repair] WARNING instructions are {len(inst_text)} chars; prompts inline only the first {REPAIR_INLINE_CHARS} "
-            f"and every agent is told to read the full file {inst_path}")
-    inst_excerpt = inst_text[:REPAIR_INLINE_CHARS] + (
-        f"\n\n[... TRUNCATED here: {len(inst_text) - REPAIR_INLINE_CHARS} more characters. Read the full file `{inst_path}`.]" if truncated else ""
-    )
-
-    locks_txt = read_text_safe(wf / "00_locks.json")
-    explicit_targets = [_paper_rel(paper_dir, x) for x in (args.get("repair_files") or [])]
-    if any(t is None for t in explicit_targets):
-        raise RuntimeError(f"repair_files must point inside {paper_dir}: {args.get('repair_files')}")
-    explicit_targets_s: List[str] = [t for t in explicit_targets if t]
-    skip_plan = bool(args.get("repair_skip_plan")) or len(explicit_targets_s) == 1
-    if args.get("repair_skip_plan") and not explicit_targets_s:
-        raise RuntimeError("repair_skip_plan=true needs repair_files (the files to hand the full instructions to)")
-
-    by_file: Dict[str, List[Dict[str, str]]] = {}
-    if skip_plan:
-        log(f"[repair] planner skipped; each of {explicit_targets_s} receives the full instructions")
-        for rel in explicit_targets_s:
-            by_file[rel] = [{"issues_to_fix": "Apply every instruction in the instructions file that concerns this file.", "instruction_refs": "(whole file)"}]
-    else:
-        plan_res = await dispatch_agent(
-            f"Plan a surgical repair inside `{paper_dir}`. The complete repair instructions are in `{inst_path}` "
-            f"({len(inst_text)} characters{'; the excerpt below is TRUNCATED, read the whole file' if truncated else ''}).\n"
-            f"1. Inspect files in `{paper_dir}` (and `macros.tex` / `refs.bib` / `sections/`).\n"
-            f"2. Break repairs into per-file work items: `target_file` (relative to `{paper_dir}`), `issues_to_fix` (what to change), "
-            f"and `instruction_refs` (where in the instructions file each fix is specified: heading, quoted first words, or line numbers).\n"
-            f"3. NEVER paraphrase text that must be inserted or replaced verbatim (acknowledgments, abstract wording, quoted sentences, "
-            f"equations, author lists): point to it in `instruction_refs`; the worker copies it from the instructions file.\n"
-            f"Explicit target filter (if non-empty, plan only these files): {explicit_targets_s}\n\n"
-            f"Current Locks:\n{locks_txt[:2500]}\n\nRepair Instructions (excerpt):\n{inst_excerpt}",
-            schema={
-                "type": "object",
-                "properties": {
-                    "work_items": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {"target_file": {"type": "string"}, "issues_to_fix": {"type": "string"}, "instruction_refs": {"type": "string"}},
-                            "required": ["target_file", "issues_to_fix"],
-                        },
-                    },
-                },
-                "required": ["work_items"],
-            },
-            role="Plan Surgical Repairs",
-            stage_name="repair",
-            tier="heavy",
-        )
-        if not isinstance(plan_res, dict):
-            raise RuntimeError(f"Repair planner returned a non-object result: {str(plan_res)[:300]}")
-        for it in plan_res.get("work_items", []):
-            if not isinstance(it, dict) or not it.get("target_file"):
-                continue
-            rel = _paper_rel(paper_dir, str(it["target_file"]))
-            if rel is None:
-                log(f"[repair] skipped work item outside the paper directory: {it.get('target_file')}")
-                continue
-            if explicit_targets_s and rel not in explicit_targets_s:
-                log(f"[repair] skipped work item for {rel}: not in repair_files")
-                continue
-            by_file.setdefault(rel, []).append({"issues_to_fix": str(it.get("issues_to_fix", "")), "instruction_refs": str(it.get("instruction_refs", ""))})
-
-    def _repair_prompt(rel: str) -> str:
-        summary = "\n".join(f"- {w['issues_to_fix']}" + (f"  [see instructions: {w['instruction_refs']}]" if w.get("instruction_refs") else "") for w in by_file[rel])
-        return (
-            f"Repair `{paper_dir / rel}`.\n"
-            f"The complete original repair instructions are in `{inst_path}` ({len(inst_text)} characters). Read the parts that concern "
-            f"this file THERE. Any text that must be inserted or replaced (acknowledgments, abstract wording, quoted sentences, equations) "
-            f"must be copied exactly from that file; never reconstruct it from the summary below, and do not search other folders for it.\n\n"
-            f"Planner summary for this file:\n{summary}\n\n"
-            f"Preserve mathematical rigor and the macros in `{paper_dir / 'macros.tex'}`. Snapshot before repair: `{snap_dir}`. "
-            f"Edit ONLY `{paper_dir / rel}`."
-        )
-
-    rels = sorted(by_file)
-    await run_guarded_edit_batches(
-        paper_dir,
-        snap_dir,
-        rels,
-        lambda rel: dispatch_agent(_repair_prompt(rel), schema={"type": "string"}, role=f"Repair: {Path(rel).name}", stage_name="repair"),
-    )
-    items = [{"target_file": r} for r in rels]
-
-    run_tool("clean_watermarks.py", ["--paths", str(paper_dir), "--profile", str(ensure_default_profile(paths)), "--fix"], allow_fail=True)
-    run_tool("audit_tex_defs.py", ["--main", str(paper_dir / "main.tex"), "--json-out", str(wf / "repair_tex_defs.json"), "--md-out", str(audit_dir / "00_tex_defs_audit.md")], allow_fail=True)
-    if (paper_dir / "refs.bib").exists():
-        run_tool("verify_citations.py", ["audit", "--tex-dir", str(paper_dir), "--bib", str(paper_dir / "refs.bib"), "--cache", str(wf / "04_api_bib_cache.json"), "--json-out", str(wf / "04_citation_audit.json"), "--md-out", str(audit_dir / "02_citation_audit.md")], allow_fail=True)
-    bld_res = await run_build(paths)
-
-    closeout = audit_dir / "06_repair_closeout.md"
-    closeout.write_text(
-        f"# Post-Repair Verification Closeout ({ts})\n\n"
-        f"- **Checkpoint Snapshot**: `{snap_dir}`\n"
-        f"- **Instructions**: `{inst_path}` ({len(inst_text)} chars{', planner skipped' if skip_plan else ''})\n"
-        f"- **Files Repaired**: {[it['target_file'] for it in items]}\n"
-        f"- **Updated Audits**: `00_tex_defs_audit.md`, `02_citation_audit.md`, `{bld_res['build_json']}`\n",
-        encoding="utf-8",
-    )
-    return {"checkpoint": str(snap_dir), "instructions": str(inst_path), "planner_skipped": skip_plan, "repaired_count": len(items), "closeout": str(closeout), **bld_res}
+    return {"blind_referee_report": str(out_md), "next": "mode=revise with repair_instructions set to this report hands it to the author"}
 
 
 # ==============================================================================
@@ -2375,7 +2768,7 @@ async def run_repair(paths: Dict[str, Path]) -> Dict[str, Any]:
 # ==============================================================================
 
 async def run_smoke_test(paths: Dict[str, Path]) -> Dict[str, Any]:
-    phase("Smoke Test v2: Python Env Resolution, 7 CLI Tools & Agent Pings")
+    phase("Smoke Test v3: Python Env Resolution, 7 CLI Tools & Agent Pings")
     py_exe = resolve_python_exe()
     expected_tools = [
         "check_math_integrity.py",
@@ -2411,9 +2804,26 @@ async def run_smoke_test(paths: Dict[str, Path]) -> Dict[str, Any]:
     return {"runtime": _STATE["runtime"], "python_exe": py_exe, "tools_ok": tool_checks, "pings": pings}
 
 
+def _pause_after_story() -> bool:
+    v = _wf_args().get("pause_after_story")
+    return True if v is None else bool(v)
+
+
+async def _check_revise_build(paths: Dict[str, Path]) -> Dict[str, Any]:
+    first = await run_check(paths)
+    if not first.get("issues"):
+        return {"check": first, "revise": {"skipped": True, "reason": "no issues"}, "build": await run_build(paths)}
+    rv = await run_revise(paths, build_after=False)
+    again = await run_check(paths)
+    return {"check": first, "revise": rv, "recheck": again, "build": await run_build(paths)}
+
+
 async def execute_mode() -> Dict[str, Any]:
     args = _wf_args()
-    mode = str(args.get("mode") or "smoke_test")
+    raw = str(args.get("mode") or "smoke_test")
+    mode = MODE_ALIASES.get(raw, raw)
+    if mode != raw:
+        log(f"[mode] '{raw}' is called '{mode}' since v3")
     paper_dir = Path(str(args["paper_dir"]))
     paths = ensure_dirs(paper_dir)
     preflight_permissions(paper_dir)
@@ -2422,53 +2832,41 @@ async def execute_mode() -> Dict[str, Any]:
         return await run_smoke_test(paths)
     if mode == "inventory":
         return await run_inventory(paths)
-    if mode == "blueprint":
-        return await run_blueprint(paths)
+    if mode == "story":
+        return await run_story(paths)
     if mode == "draft":
         return await run_draft(paths)
     if mode == "figures":
         return await run_figures(paths)
-    if mode == "verify":
-        return await run_verify(paths)
-    if mode == "citations":
-        return await run_citations(paths)
-    if mode == "hygiene":
-        return await run_hygiene(paths)
+    if mode == "check":
+        return await run_check(paths)
+    if mode == "revise":
+        return await run_revise(paths, build_after=True, prefer_referee=(raw == "repair"))
+    if mode == "cleanup":
+        return await run_cleanup(paths)
     if mode == "build":
         return await run_build(paths)
     if mode == "blind_referee":
         return await run_blind_referee(paths)
-    if mode == "repair":
-        return await run_repair(paths)
-    if mode == "audit_polish":
-        return {
-            "verify": await run_verify(paths),
-            "citations": await run_citations(paths),
-            "hygiene": await run_hygiene(paths),
-            "build": await run_build(paths),
-        }
-    if mode == "draft_and_audit":
-        return {
-            "draft": await run_draft(paths),
-            "verify": await run_verify(paths),
-            "citations": await run_citations(paths),
-            "hygiene": await run_hygiene(paths),
-            "build": await run_build(paths),
-        }
-    if mode == "full_auto":
-        inv = await run_inventory(paths)
-        bp = await run_blueprint(paths, inv)
-        dr = await run_draft(paths)
-        bp_data, _ = validate_blueprint(Path(str(args.get("blueprint_path") or (paths["wf"] / "01_blueprint.json"))))
-        wants_figures = bool(args.get("figure_specs_path") or list(paths["fig_scripts"].glob("make_fig*.py")) or (bp_data and bp_data.get("figures")))
-        fg = await run_figures(paths) if wants_figures else {"skipped": True, "reason": "no figure specs, scripts, or blueprint figures"}
-        vf = await run_verify(paths)
-        ct = await run_citations(paths)
-        hy = await run_hygiene(paths)
-        bl = await run_build(paths)
-        br = await run_blind_referee(paths)
-        return {"inventory": inv, "blueprint": bp, "draft": dr, "figures": fg, "verify": vf, "citations": ct, "hygiene": hy, "build": bl, "blind_referee": br}
-    raise ValueError(f"Unsupported mode: {mode}")
+    if mode == "check_and_revise":
+        return await _check_revise_build(paths)
+    if mode in ("draft_and_check", "full_auto"):
+        out: Dict[str, Any] = {}
+        if mode == "full_auto":
+            out["inventory"] = await run_inventory(paths)
+            out["story"] = await run_story(paths, out["inventory"])
+            if _pause_after_story():
+                msg = (f"Paused for the author: read {paths['wf'] / '01_story.md'} (edit it and 01_plan.json if needed), "
+                       f"then run mode=draft_and_check. Set pause_after_story=false to run straight through.")
+                log(msg)
+                return {**out, "paused": True, "next": msg}
+        out["draft"] = await run_draft(paths)
+        out["figures"] = await run_figures(paths) if _wants_figures(paths) else {"skipped": True, "reason": "no figure specs, scripts, or plan figures"}
+        out.update(await _check_revise_build(paths))
+        if mode == "full_auto":
+            out["blind_referee"] = await run_blind_referee(paths)
+        return out
+    raise ValueError(f"Unsupported mode: {raw}")
 
 
 async def run_from_antigravity(host_globals: Dict[str, Any]) -> Dict[str, Any]:
@@ -2481,6 +2879,8 @@ async def run_from_antigravity(host_globals: Dict[str, Any]) -> Dict[str, Any]:
     _STATE.update({
         "runtime": "antigravity",
         "backend": "antigravity",
+        "referee_backend": str(wf_args.get("referee_backend") or ""),
+        "check_backend": str(wf_args.get("check_backend") or ""),
         "wf_args": wf_args,
         "models_cfg": dict(wf_args.get("models") or {}),
         "batch_size": max(1, min(8, int(wf_args.get("max_parallel") or 4))),
@@ -2557,12 +2957,14 @@ async def run_from_cli(
     backend: str = "auto",
     referee_backend: str = "",
     skip_agent_pings: bool = False,
+    check_backend: str = "",
 ) -> Dict[str, Any]:
     """Entry point invoked by `run_paper.py` under Claude Code, Codex, agy CLI, or terminal."""
     _STATE.update({
         "runtime": "cli",
         "backend": backend,
-        "referee_backend": referee_backend,
+        "referee_backend": referee_backend or str(args_dict.get("referee_backend") or ""),
+        "check_backend": check_backend or str(args_dict.get("check_backend") or ""),
         "wf_args": dict(args_dict),
         "models_cfg": dict(args_dict.get("models") or {}),
         "batch_size": max(1, min(8, int(args_dict.get("max_parallel") or 4))),

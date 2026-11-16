@@ -247,7 +247,57 @@ def _load_extra_tag_patterns(main_tex: Path, cli_patterns: Sequence[str]) -> Lis
     return pats
 
 
-def audit_project(main_tex: Path, supplement_tex: Optional[Path] = None, extra_symbols: Sequence[str] = (), extra_tag_patterns: Sequence[str] = ()) -> Dict[str, object]:
+_ROMAN_NUMERALS = {"II", "III", "IV", "VI", "VII", "VIII", "IX", "XI", "XII"}
+
+
+def _math_plain(m: str) -> str:
+    m = re.sub(r"\\(?:mathrm|text|mathbb|mathcal|mathbf|operatorname)\s*\{([^{}]*)\}", r"\1", m)
+    m = re.sub(r"\\[A-Za-z]+", "x", m)  # a command such as \eta renders as about one glyph
+    return re.sub(r"[{}^_\s]", "", m)
+
+
+def abstract_plain_text(abstract_tex: str) -> str:
+    """Rough rendered text of an abstract, for a character count (an estimate, not a typeset count)."""
+    t = re.sub(r"\\cite\w*\s*(?:\[[^\]]*\])?\s*\{[^}]*\}", "[1]", abstract_tex)
+    t = re.sub(r"\$([^$]*)\$", lambda mm: _math_plain(mm.group(1)), t)
+    t = re.sub(r"\\(?:emph|textit|textbf|textrm|mathrm|text)\s*\{([^{}]*)\}", r"\1", t)
+    t = t.replace("---", "\u2014").replace("--", "\u2013").replace("~", " ")
+    t = re.sub(r"\\[A-Za-z]+\*?", "", t)
+    t = re.sub(r"[{}]", "", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def audit_abstract(abstract_tex: str, max_chars: int = 0, allowed_acronyms: Sequence[str] = ()) -> Tuple[List[Dict[str, object]], List[str], int]:
+    """An abstract is read alone: flag acronyms it does not expand, and a length over the venue limit.
+
+    Returns (issues, inline math expressions used, estimated character count). The math list is for the
+    reader-level check; whether each symbol is explained in words is a judgement, not a regex.
+    """
+    issues: List[Dict[str, object]] = []
+    plain = abstract_plain_text(abstract_tex)
+    if max_chars and len(plain) > max_chars:
+        issues.append({"kind": "abstract_too_long", "chars": len(plain), "limit": max_chars})
+    math = [m.strip() for m in re.findall(r"\$([^$]+)\$", abstract_tex)]
+    prose = re.sub(r"\$[^$]*\$", " ", abstract_tex)
+    prose = re.sub(r"\\cite\w*\s*(?:\[[^\]]*\])?\s*\{[^}]*\}", " ", prose)
+    prose = re.sub(r"\\[A-Za-z]+\*?", " ", prose)
+    allowed = {a.strip() for a in allowed_acronyms if a.strip()} | _ROMAN_NUMERALS
+    seen: Set[str] = set()
+    for tok in re.findall(r"(?<![\w-])[A-Za-z0-9]*[A-Z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*(?![\w-])", prose):
+        letters = [c for c in tok if c.isalpha()]
+        if sum(c.isupper() for c in letters) * 3 < len(letters) * 2:
+            continue  # McDonald, LaTeX-like names: not acronyms
+        base = tok[:-1] if tok.endswith("s") and tok[:-1].isupper() else tok
+        if base in seen or base in allowed:
+            continue
+        seen.add(base)
+        if not re.search(rf"\(\s*{re.escape(base)}s?\b", prose):
+            issues.append({"kind": "abstract_unexpanded_acronym", "acronym": base})
+    return issues, math, len(plain)
+
+
+def audit_project(main_tex: Path, supplement_tex: Optional[Path] = None, extra_symbols: Sequence[str] = (), extra_tag_patterns: Sequence[str] = (),
+                  abstract_max_chars: int = 0, abstract_allowed_acronyms: Sequence[str] = ()) -> Dict[str, object]:
     root_dir = main_tex.parent
     missing_inputs: List[str] = []
     main_stream = _expand_tex_tree(main_tex, root_dir, missing_inputs)
@@ -343,6 +393,7 @@ def audit_project(main_tex: Path, supplement_tex: Optional[Path] = None, extra_s
     undefined_main_symbols: List[Dict[str, object]] = []
     abs_m = re.search(r"\\begin\{abstract\}([\s\S]*?)\\end\{abstract\}", main_clean)
     abstract_text = abs_m.group(1) if abs_m else ""
+    abstract_issues, abstract_math, abstract_chars = audit_abstract(abstract_text, abstract_max_chars, abstract_allowed_acronyms) if abstract_text else ([], [], 0)
     if abstract_text:
         for om in re.finditer(r"\b([A-Z])\(((?:\\[A-Za-z]{2,}|[a-zA-Z])_(?:\{[^{}\n]{1,18}\}|[a-zA-Z0-9]))\)", abstract_text):
             op_head = re.escape(om.group(1) + "(")
@@ -400,11 +451,15 @@ def audit_project(main_tex: Path, supplement_tex: Optional[Path] = None, extra_s
         "no_ghost_sections": not section_mismatches,
         "no_undefined_main_symbols": not undefined_main_symbols,
         "no_dual_symbol_conflicts": not dual_conflicts,
+        "abstract_reads_alone": not abstract_issues,
     }
     return {
         "passed": all(checks.values()),
         "checks": checks,
         "files_scanned": sorted({rel for rel, _, _ in main_stream + supp_stream}),
+        "abstract_issues": abstract_issues,
+        "abstract_math": abstract_math,
+        "abstract_chars_est": abstract_chars,
         "internal_tag_leaks": tag_leaks,
         "unresolved_refs": unresolved_refs,
         "section_mismatches": section_mismatches,
@@ -422,6 +477,8 @@ def main() -> int:
     parser.add_argument("--supplement", type=Path, help="Optional path to supplement.tex")
     parser.add_argument("--extra-symbols", nargs="*", default=[], help="Extra TeX symbols requiring an explicit in-main definition")
     parser.add_argument("--extra-tag-patterns", nargs="*", default=[], help="Extra regexes for project-internal tags (also read from .wp_internal_tags.txt next to main.tex)")
+    parser.add_argument("--abstract-max-chars", type=int, default=0, help="Venue limit for the abstract in rendered characters, e.g. 600 for PRL (0 = no limit)")
+    parser.add_argument("--abstract-allowed-acronyms", nargs="*", default=[], help="Acronyms the abstract may use without expanding them")
     parser.add_argument("--json-out", type=Path, help="Optional JSON output path")
     parser.add_argument("--md-out", type=Path, help="Optional Markdown summary output path")
     args = parser.parse_args()
@@ -436,7 +493,8 @@ def main() -> int:
     if supp is None and (args.main.parent / "supplement.tex").exists():
         supp = args.main.parent / "supplement.tex"
 
-    rep = audit_project(args.main, supp, extra_symbols=args.extra_symbols, extra_tag_patterns=args.extra_tag_patterns)
+    rep = audit_project(args.main, supp, extra_symbols=args.extra_symbols, extra_tag_patterns=args.extra_tag_patterns,
+                        abstract_max_chars=args.abstract_max_chars, abstract_allowed_acronyms=args.abstract_allowed_acronyms)
     if args.json_out:
         write_new(args.json_out, json.dumps(rep, indent=2, ensure_ascii=False))
     if args.md_out:
@@ -447,6 +505,7 @@ def main() -> int:
             f"- **Internal Tag Leaks**: {len(rep['internal_tag_leaks'])} | **Unresolved Refs / Inputs**: {len(rep['unresolved_refs'])}",  # type: ignore[arg-type]
             f"- **Ghost Section / Header Mismatches**: {len(rep['section_mismatches'])} | **Undefined Main Symbols**: {len(rep['undefined_main_symbols'])}",  # type: ignore[arg-type]
             f"- **Terminology Conflicts**: {len(rep['dual_symbol_conflicts'])} | **Bare SM Mentions without `\\cite`**: {len(rep['bare_sm_without_cite'])}",  # type: ignore[arg-type]
+            f"- **Abstract**: ~{rep['abstract_chars_est']} characters; {len(rep['abstract_issues'])} issues (unexpanded acronyms, over the limit)",  # type: ignore[arg-type]
             "",
         ]
         for title_k, key in (
@@ -455,6 +514,7 @@ def main() -> int:
             ("## Section / Header Mismatches", "section_mismatches"),
             ("## Undefined Main-Text Symbols", "undefined_main_symbols"),
             ("## Terminology Conflicts", "dual_symbol_conflicts"),
+            ("## Abstract (read alone)", "abstract_issues"),
         ):
             items = rep[key]  # type: ignore[index]
             if items:

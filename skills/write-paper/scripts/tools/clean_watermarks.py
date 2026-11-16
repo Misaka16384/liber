@@ -344,11 +344,12 @@ def _match_case(template: str, replacement: str) -> str:
     return replacement
 
 
-def _scan_copyedit_issues(scan_text: str, prose_only: str) -> List[Dict[str, object]]:
+def _scan_copyedit_issues(scan_text: str, prose_only: str, prose_marked: Optional[str] = None) -> List[Dict[str, object]]:
     issues: List[Dict[str, object]] = []
 
-    # 1. Doubled consecutive identical words outside math (e.g., "rank rank")
-    for m in re.finditer(r"\b([A-Za-z]{2,})[ \t]+(\1)\b", prose_only, flags=re.I):
+    # 1. Doubled consecutive identical words outside math (e.g., "rank rank"). `prose_marked` masks math with a
+    #    visible placeholder, so "of $J$ and $h$ and" is not read as "and and" once the math is blanked out.
+    for m in re.finditer(r"\b([A-Za-z]{2,})[ \t]+(\1)\b", prose_marked if prose_marked is not None else prose_only, flags=re.I):
         if m.group(1).lower() in {"that", "had"}:
             continue
         line = prose_only.count("\n", 0, m.start()) + 1
@@ -489,6 +490,7 @@ def process_file(
             if masked_chars[k] != "\n":
                 masked_chars[k] = " "
     prose_only = "".join(masked_chars)
+    prose_marked = "".join("·" if (c == " " and o != " ") else c for c, o in zip(masked_chars, scan_text))
 
     ai_hits: List[Dict[str, object]] = []
     for label, pat in AI_SLOP_PATTERNS:
@@ -510,7 +512,7 @@ def process_file(
             em_dash_paras.append({"line": line, "em_dash_count": cnt})
         cursor += len(para) + 2
 
-    copyedit_issues = _scan_copyedit_issues(scan_text, prose_only)
+    copyedit_issues = _scan_copyedit_issues(scan_text, prose_only, prose_marked)
 
     # Strictly vetted rhetorical / non-scientific hints (never emitted unless vetted in profile)
     rhetorical_hints: List[Dict[str, object]] = []

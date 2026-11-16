@@ -1,6 +1,6 @@
 {
   "name": "write-paper",
-  "description": "Modular, re-entrant theoretical physics LaTeX paper workflow (v2): GT/CS locks, reverse-audited blueprint, Few-Shot exemplar drafting, PRL/Nature figure geometry & AST verification, 3-way verification, dual DOI+arXiv+.bbl citation audit, positive-ROI prose hygiene, blind referee gate, and targeted repair.",
+  "description": "Modular, re-entrant theoretical physics LaTeX paper workflow (v3, story first): material pack, verified lineage and a one-page story the author approves, one author drafting the main text block by block, a report-only check (scope, quantifiers, attribution, numbers, abstract read alone), author revision, deterministic clean-up and build, PRL/Nature figure gates, and an optional blind referee panel.",
   "entry": "paper_workflow.py",
   "args": {
     "type": "object",
@@ -9,21 +9,27 @@
         "type": "string",
         "enum": [
           "inventory",
-          "blueprint",
+          "story",
           "draft",
           "figures",
+          "check",
+          "revise",
+          "cleanup",
+          "build",
+          "blind_referee",
+          "draft_and_check",
+          "check_and_revise",
+          "full_auto",
+          "smoke_test",
+          "blueprint",
           "verify",
           "citations",
           "hygiene",
-          "build",
-          "blind_referee",
           "repair",
           "draft_and_audit",
-          "audit_polish",
-          "full_auto",
-          "smoke_test"
+          "audit_polish"
         ],
-        "description": "On-demand modular execution phase or composite pipeline."
+        "description": "Phase or pipeline. v2 names are aliases: blueprint=story, verify/citations=check, hygiene=cleanup, repair=revise, draft_and_audit=draft_and_check, audit_polish=check_and_revise."
       },
       "paper_dir": {
         "type": "string",
@@ -31,18 +37,24 @@
       },
       "source_paths": {
         "type": "array",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "description": "Directories or files containing core derivation notes, reports, verification scripts, and figures."
       },
       "authority_paths": {
         "type": "array",
-        "items": { "type": "string" },
-        "description": "Highest-authority ground-truth scope, redline, and numeric protocol documents used to lock 00_locks.json and reverse-check blueprints."
+        "items": {
+          "type": "string"
+        },
+        "description": "Highest-authority scope, red-line and numeric protocol documents; the checkers compare the manuscript against them and the ledger."
       },
       "exemplar_paths": {
         "type": "array",
-        "items": { "type": "string" },
-        "description": "Reference exemplar papers (.tex or .pdf) authored by the group for Few-Shot voice learning and vetted connector profiling."
+        "items": {
+          "type": "string"
+        },
+        "description": "Well-written published papers (.tex or .pdf); curated paragraphs from them are the author's voice samples."
       },
       "existing_bib": {
         "type": "string",
@@ -50,19 +62,62 @@
       },
       "genre": {
         "type": "string",
-        "enum": ["letter", "long"],
+        "enum": [
+          "letter",
+          "long"
+        ],
         "default": "long",
         "description": "Target venue format: 'letter' (PRL + SuppMat) or 'long' (PRB/PRX/CMP + Appendices)."
       },
       "figure_style": {
         "type": "string",
-        "enum": ["prl", "nature"],
+        "enum": [
+          "prl",
+          "nature"
+        ],
         "default": "prl",
         "description": "Journal visual style preset for figures phase and verify_figures.py."
       },
+      "plan_path": {
+        "type": "string",
+        "description": "Optional explicit path to 01_plan.json (defaults to <paper_dir>/.workflow/01_plan.json)."
+      },
+      "pause_after_story": {
+        "type": "boolean",
+        "default": true,
+        "description": "full_auto: stop after the story stage so the author can read (and edit) 01_story.md and 01_plan.json; then run draft_and_check."
+      },
+      "max_numeric_checks": {
+        "type": "integer",
+        "default": 12,
+        "minimum": 0,
+        "description": "check: how many core results get an independent scripted (SymPy/numerical) check."
+      },
+      "check_backend": {
+        "type": "string",
+        "enum": [
+          "",
+          "claude",
+          "agy",
+          "codex"
+        ],
+        "default": "",
+        "description": "Run the check stage on another vendor's CLI (e.g. Gemini writes, Claude checks). Works in both runtimes."
+      },
+      "referee_backend": {
+        "type": "string",
+        "enum": [
+          "",
+          "claude",
+          "agy",
+          "codex"
+        ],
+        "default": "",
+        "description": "Run blind_referee on another vendor's CLI."
+      },
       "blueprint_path": {
         "type": "string",
-        "description": "Optional explicit path to 01_blueprint.json (defaults to <paper_dir>/.workflow/01_blueprint.json)."
+        "description": "v2 workspaces only: 01_blueprint.json, read for its figure list."
       },
       "supplement_tex": {
         "type": "string",
@@ -78,29 +133,38 @@
       },
       "repair_instructions": {
         "type": "string",
-        "description": "Path to a review/audit report (.md/.txt) or inline change instructions for mode='repair'."
+        "description": "mode='revise' (alias 'repair'): a referee/audit report path or the instructions as text. Without it, revise works from the latest check report (.workflow/03_issues.json)."
       },
       "repair_files": {
         "type": "array",
-        "items": { "type": "string" },
-        "description": "Optional subset of files to target in mode='repair' (relative to paper_dir or absolute)."
+        "items": {
+          "type": "string"
+        },
+        "description": "Optional subset of files for mode='revise' with instructions (relative to paper_dir or absolute)."
       },
       "routing_policy": {
         "type": "string",
-        "enum": ["auto_tiered", "uniform_inherit"],
+        "enum": [
+          "auto_tiered",
+          "uniform_inherit"
+        ],
         "default": "auto_tiered",
         "description": "auto_tiered: each call is routed by its task tier (heavy / builder / fast / probe) to a model per runtime; uniform_inherit: every call uses the host/CLI default. An explicit models[stage] always wins."
       },
       "plan_mode": {
         "type": "string",
-        "enum": ["auto", "on", "off"],
+        "enum": [
+          "auto",
+          "on",
+          "off"
+        ],
         "default": "auto",
         "description": "Antigravity only: whether run_workflow was called from a Planning Turn. 'auto' reads it from trajectory(); 'off' (Execution Turn) sends inherit-tier calls to the standalone agy CLI (or model='pro' without it), because an inherit sub-agent deadlocks on '[plan review due]' there."
       },
       "repair_skip_plan": {
         "type": "boolean",
         "default": false,
-        "description": "mode='repair': skip the LLM planner and give every file in repair_files the full instructions (automatic when repair_files has exactly one file)."
+        "description": "mode='revise' with instructions: skip the LLM router and give every file in repair_files the full instructions (automatic when repair_files has exactly one file)."
       },
       "sync_bib": {
         "type": "string",
@@ -135,27 +199,72 @@
       "skip_lm": {
         "type": "boolean",
         "default": true,
-        "description": "Skip GPT-2 perplexity scoring in style_metrics.py (v2 disables perplexity chasing by default)."
+        "description": "Ignored since v3 (style_metrics never scores perplexity); kept so older Args stay valid."
       },
       "models": {
         "type": "object",
-        "description": "Explicit per-stage models (override routing_policy). Leave a stage out (or 'inherit') to let routing_policy decide. Antigravity: native tiers ('inherit', 'pro', 'flash', 'flash_lite') or an agy model id (runs on the agy CLI); CLI backends: a model name for that CLI.",
+        "description": "Explicit per-stage models (override routing_policy); v2 stage names (narrative, cross_verify, citation_check, repair) still map to story, check, check, revise. Antigravity: native tiers ('inherit', 'pro', 'flash', 'flash_lite') or an agy model id; CLI backends: a model name for that CLI.",
         "properties": {
-          "inventory": { "type": "string", "default": "inherit" },
-          "narrative": { "type": "string", "default": "inherit" },
-          "draft": { "type": "string", "default": "inherit" },
-          "figures": { "type": "string", "default": "inherit" },
-          "cross_verify": { "type": "string", "default": "inherit" },
-          "citation_check": { "type": "string", "default": "inherit" },
-          "hygiene": { "type": "string", "default": "inherit" },
-          "compile_fix": { "type": "string", "default": "inherit" },
-          "blind_referee": { "type": "string", "default": "inherit" },
-          "repair": { "type": "string", "default": "inherit" }
+          "inventory": {
+            "type": "string",
+            "default": "inherit"
+          },
+          "story": {
+            "type": "string",
+            "default": "inherit"
+          },
+          "draft": {
+            "type": "string",
+            "default": "inherit"
+          },
+          "figures": {
+            "type": "string",
+            "default": "inherit"
+          },
+          "check": {
+            "type": "string",
+            "default": "inherit"
+          },
+          "revise": {
+            "type": "string",
+            "default": "inherit"
+          },
+          "compile_fix": {
+            "type": "string",
+            "default": "inherit"
+          },
+          "blind_referee": {
+            "type": "string",
+            "default": "inherit"
+          },
+          "narrative": {
+            "type": "string",
+            "default": "inherit"
+          },
+          "cross_verify": {
+            "type": "string",
+            "default": "inherit"
+          },
+          "citation_check": {
+            "type": "string",
+            "default": "inherit"
+          },
+          "hygiene": {
+            "type": "string",
+            "default": "inherit"
+          },
+          "repair": {
+            "type": "string",
+            "default": "inherit"
+          }
         },
         "additionalProperties": false
       }
     },
-    "required": ["mode", "paper_dir"],
+    "required": [
+      "mode",
+      "paper_dir"
+    ],
     "additionalProperties": false
   }
 }
