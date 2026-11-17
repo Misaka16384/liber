@@ -471,13 +471,13 @@ def test_revise_hands_full_instructions_to_workers():
         planner = [c for c in fake.calls if c["role"] == "Plan Revisions"][0]["prompt"]
         assert "TRUNCATED" in planner and str(inst) in planner
         workers = [c for c in fake.calls if c["role"].startswith("Revise:")]
-        assert [c["role"] for c in workers] == ["Revise: main.tex"], "items for one file are merged; items outside paper_dir dropped"
+        assert [c["role"] for c in workers] == ["Revise: main text"], "main-text items go to one author; items outside paper_dir dropped"
         assert str(inst) in workers[0]["prompt"] and "second fix" in workers[0]["prompt"] and "line 1" in workers[0]["prompt"]
 
         fake.calls.clear()
         we._STATE["wf_args"] = {"paper_dir": str(p), "repair_instructions": str(inst), "repair_files": ["sections/a.tex"]}
         res = asyncio.run(we.run_revise(we.ensure_dirs(p)))
-        assert res["planner_skipped"] and [c["role"] for c in fake.calls] == ["Revise: a.tex"], "single repair file skips the planner"
+        assert res["planner_skipped"] and [c["role"] for c in fake.calls] == ["Revise: main text"], "single repair file skips the planner"
     finally:
         we._STATE["runtime"] = "cli"
         we.run_tool, we.run_build = orig_tool, orig_build
@@ -876,11 +876,12 @@ def test_draft_one_author_writes_blocks_in_order_with_exact_records():
     finally:
         we._STATE["runtime"] = "cli"
     author = [c for c in fake.calls if c["role"] == "Author"]
-    assert len(author) == 4, [c["role"] for c in fake.calls]
+    assert len(author) == 3, [c["role"] for c in fake.calls]
     assert "Block 1/2 `question`" in author[0]["prompt"] and "This is the opening block." in author[0]["prompt"]
     assert "Block 2/2 `result`" in author[1]["prompt"] and "sections/s1.tex" in author[1]["prompt"].replace("\\", "/")
-    assert "abstract" in author[2]["prompt"] and "600 characters" in author[2]["prompt"]
-    assert "Read the whole main text" in author[3]["prompt"]
+    assert "Read the whole main text" in author[2]["prompt"] and "abstract" in author[2]["prompt"] and "600 characters" in author[2]["prompt"]
+    assert author[2]["prompt"].index("Read the whole main text") < author[2]["prompt"].index("write the title and the abstract"), \
+        "the abstract is written for the text after the read-through"
     assert LONG_STATEMENT in author[0]["prompt"], "ledger records are joined in full, never truncated or paraphrased"
     assert "E0 = -1.2732 for H_7" in author[1]["prompt"] and "E0 = -1.2732" not in author[0]["prompt"]
     sm = [c for c in fake.calls if c["role"] == "SM proof"]
@@ -903,7 +904,7 @@ def test_check_reports_only_and_writes_issue_file():
         (p / "sections" / "s1.tex").write_text("REWRITTEN BY A CHECKER\n", encoding="utf-8")
         return {"issues": [{"file": "sections/s1.tex", "location": "1", "quote": "text of s1", "problem": "overclaims THM-1", "severity": "high"}]}
 
-    fake = FakeAgy(answers={"Check s1.tex": vandal_check, "Check": {"issues": []}, "Numeric": {"issues": []},
+    fake = FakeAgy(answers={"Check main text": vandal_check, "Check": {"issues": []}, "Numeric": {"issues": []},
                             "Reader Check": {"issues": [{"file": "main.tex", "problem": "the introduction never says why it matters", "severity": "medium"}]}})
     we = _antigravity_engine(p, fake, genre="letter")
     orig_tool = we.run_tool
@@ -932,18 +933,34 @@ def test_check_reports_only_and_writes_issue_file():
     assert sorted(numeric) == ["Numeric NUM-2", "Numeric THM-1"], "scripted checks go to core results, not the first N"
     reader = [c for c in fake.calls if c["role"] == "Reader Check"][0]["prompt"]
     assert "\\eta" in reader and "what is new here" in reader
-    checker = [c for c in fake.calls if c["role"] == "Check s2.tex"][0]["prompt"]
+    checkers = sorted(c["role"] for c in fake.calls if c["role"].startswith("Check "))
+    assert checkers == ["Check main text", "Check supplement"] and res["checkers"] == 5, "main text read whole by one checker; SM grouped"
+    main_checker = [c for c in fake.calls if c["role"] == "Check main text"][0]["prompt"].replace("\\", "/")
+    assert main_checker.index("sections/s1.tex") < main_checker.index("sections/s2.tex") < main_checker.index("main.tex`")
+    checker = [c for c in fake.calls if c["role"] == "Check supplement"][0]["prompt"]
     assert "Do not use `01_story.md`" in checker and "Report nothing about style" in checker
+
+    fake.calls.clear()
+    we._STATE["runtime"] = "antigravity"
+    we.run_tool = fake_tool
+    try:
+        after = asyncio.run(we.run_check(we.ensure_dirs(p), llm=False))
+    finally:
+        we.run_tool = orig_tool
+        we._STATE["runtime"] = "cli"
+    assert not fake.calls and after["issues"] == 1, "after revise only the programs run"
+    assert (p / ".workflow" / "03_issues_after_revise.json").exists() and (p / "audit_reports" / "01_check_report_after_revise.md").exists()
 
 
 def test_revise_works_from_issues_in_reading_order():
     p, plan = _v3_workspace("revise")
     (p / "sections").mkdir()
-    for f in ("s1", "s2", "sm1"):
+    for f in ("s1", "s2", "sm1", "sm2"):
         (p / "sections" / f"{f}.tex").write_text(f"text of {f}\n", encoding="utf-8")
     (p / "main.tex").write_text("\\input{sections/s1} % \\input{sections/old}\n\\input{sections/s2}\n", encoding="utf-8")
     issues = [{"file": f, "problem": f"fix {f}", "severity": "medium"} for f in ("main.tex", "sections/s2.tex", "sections/sm1.tex", "sections/s1.tex")]
     issues.append({"file": f"{p.name}/sections/s2.tex", "problem": "same file, spelled from the agent's cwd", "severity": "low"})
+    issues.append({"file": "sections/sm2.tex", "problem": "a short sentence run", "severity": "low"})
     (p / ".workflow" / "03_issues.json").write_text(json.dumps({"issues": issues}), encoding="utf-8")
     fake = FakeAgy(answers={"Revise": {"fixed": ["done"], "declined": []}})
     we = _antigravity_engine(p, fake, genre="letter")
@@ -951,12 +968,59 @@ def test_revise_works_from_issues_in_reading_order():
         res = asyncio.run(we.run_revise(we.ensure_dirs(p), build_after=False))
     finally:
         we._STATE["runtime"] = "cli"
-    assert [c["role"] for c in fake.calls] == ["Revise: sm1.tex", "Revise: s1.tex", "Revise: s2.tex", "Revise: main.tex"], \
-        "SM first, then the main text in reading order with the abstract (main.tex) last; one work item per file"
-    assert "never by adding qualifiers" in fake.calls[1]["prompt"] and "600 characters" in fake.calls[1]["prompt"]
-    assert "fix sections/s1.tex" in fake.calls[1]["prompt"] and "spelled from the agent's cwd" in fake.calls[2]["prompt"]
+    assert [c["role"] for c in fake.calls] == ["Revise: sm1.tex", "Revise: main text"], \
+        "SM files in parallel, then one author for the whole main text; a file with only low issues is skipped"
+    main = fake.calls[1]["prompt"]
+    assert main.index("### sections/s1.tex") < main.index("### sections/s2.tex") < main.index("### main.tex"), "reading order, abstract last"
+    assert "never by adding qualifiers" in main and "600 characters" in main and "spelled from the agent's cwd" in main
+    assert res["skipped_low"] == ["sections/sm2.tex"] and res["agent_calls"] == 2
     assert res["instructions"].endswith("03_issues.json") and (p / "audit_reports" / "06_revise_report.md").exists()
     assert we.main_part_files(p) == ["sections/s1.tex", "sections/s2.tex", "main.tex"], "commented-out inputs are ignored"
+
+
+def test_inventory_merges_by_program_and_caches_scans():
+    p = tmpdir("inv")
+    notes = p / "notes"
+    notes.mkdir()
+    (notes / "a.md").write_text("E0 = -4/pi\n", encoding="utf-8")
+    (notes / "b.md").write_text("E0 = -4/pi\ngap 2|J-h|\n", encoding="utf-8")
+    wf = p / ".workflow"
+
+    def scan(prompt):
+        recs = []
+        if "a.md" in prompt:
+            recs.append({"file": "a.md", "claims": [{"statement": "E0 = -4/pi for H(1,1)", "kind": "number", "lines": "1"}]})
+        if "b.md" in prompt:
+            recs.append({"file": str(notes / "b.md"), "claims": [{"statement": "E0 = -4/pi", "kind": "number"},
+                                                                {"statement": "gap 2|J-h|", "kind": "theorem", "hypotheses": "infinite chain"}]})
+        return {"records": recs}
+
+    def judge(prompt):
+        for n in ("00_redlines.md", "00_story_material.md"):
+            (wf / n).write_text("x\n", encoding="utf-8")
+        return {"core": ["b-2"], "duplicates": [["a-1", "b-1"]], "cited_seed_hints": ["Pfeuty 1970"]}
+
+    fake = FakeAgy(answers={"Scan": scan, "Judge Material Pack": judge})
+    we = _antigravity_engine(p, fake, source_paths=[str(notes)])
+    try:
+        res = asyncio.run(we.run_inventory(we.ensure_dirs(p)))
+        ledger = json.loads((wf / "00_ground_truth_ledger.json").read_text(encoding="utf-8"))
+        assert [c["id"] for c in ledger["claims"]] == ["a-1", "b-2"], "ids from the source file; duplicate b-1 merged into a-1"
+        assert ledger["claims"][0]["statement"] == "E0 = -4/pi for H(1,1)" and ledger["claims"][0]["also_in"]
+        assert ledger["claims"][1]["tier"] == "core" and ledger["claims"][1]["hypotheses"] == "infinite chain"
+        assert res["cited_seed_hints"] == ["Pfeuty 1970"] and [c["role"] for c in fake.calls] == ["Scan a.md (+1)", "Judge Material Pack"]
+
+        fake.calls.clear()
+        res = asyncio.run(we.run_inventory(we.ensure_dirs(p)))
+        assert not fake.calls and res["reused"], "unchanged sources: no scan and no judgement"
+
+        (notes / "b.md").write_text("E0 = -4/pi\ngap 2|J-h|\nnew note\n", encoding="utf-8")
+        res = asyncio.run(we.run_inventory(we.ensure_dirs(p)))
+        scans = [c for c in fake.calls if c["role"].startswith("Scan")]
+        assert len(scans) == 1 and "b.md" in scans[0]["prompt"] and "a.md" not in scans[0]["prompt"], "only the changed file is rescanned"
+        assert [c["role"] for c in fake.calls][-1] == "Judge Material Pack" and res["rescanned_jobs"] == 1
+    finally:
+        we._STATE["runtime"] = "cli"
 
 
 def test_cross_vendor_check_routing_and_legacy_stage_models():

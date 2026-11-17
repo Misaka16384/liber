@@ -33,10 +33,12 @@ flowchart LR
   P --> S2["draft: one author, block by block (SM in parallel)"]
   S2 --> F["figures (PRL/Nature theme + PyMuPDF/AST gate)"]
   F --> C["check: report only (scope, numbers, citations, abstract read alone)"]
-  C --> R["revise: the author fixes, smallest edit"]
-  R --> C2["check again"] --> B["build (clean-up, dual compile, arXiv flatten)"]
-  B --> Ref["blind_referee (isolated, optionally cross-vendor)"] --> R
+  C --> R["revise: one author fixes the main text in one pass"]
+  R --> C2["programs re-check"] --> B["build (clean-up, dual compile, arXiv flatten)"]
+  B -.-> Ref["blind_referee, when you ask (isolated, optionally cross-vendor)"] -.-> R
 ```
+
+The whole story is written first and checked once, all checkers in one parallel pool. A second LLM check and the referee panel run only when you ask.
 
 ---
 
@@ -106,7 +108,7 @@ python skills/write-paper/scripts/run_paper.py \
   --genre letter \
   --figure-style prl
 
-# 2. After reading (and editing) the story: draft, figures, check, revise, check, build.
+# 2. After reading (and editing) the story: draft, figures, check, revise, deterministic re-check, build.
 #    Gemini (agy) writes, Claude checks.
 python skills/write-paper/scripts/run_paper.py \
   --mode draft_and_check \
@@ -123,7 +125,7 @@ python skills/write-paper/scripts/run_paper.py --mode revise --paper-dir ./paper
   --repair-instructions ./paper/audit_reports/05_blind_referee_report.md
 ```
 
-`--no-pause` runs `full_auto` straight through. Old mode names still work (`blueprint`, `verify`, `citations`, `hygiene`, `repair`, `draft_and_audit`, `audit_polish`).
+`--no-pause` runs `full_auto` straight through. For one paper, step 1 runs once (unchanged notes are not rescanned); step 2 can be repeated. `--max-parallel 6` (up to 8) speeds up every parallel phase if your API quota allows. Old mode names still work (`blueprint`, `verify`, `citations`, `hygiene`, `repair`, `draft_and_audit`, `audit_polish`).
 
 ### Option C: Run Antigravity Native `run_workflow`
 Pass `scripts/paper_workflow.py` as `ScriptPath` with `Args` matching `scripts/workflow.json`.
@@ -141,12 +143,12 @@ Every stage can be run on its own, also on an existing draft:
 
 | Mode | What it does |
 | :--- | :--- |
-| `inventory` | Material pack: `00_ground_truth_ledger.json` (every result with its exact statement, hypotheses, numbers, source and tier), `00_redlines.md` (your prohibitions: the only rule list writers see), `00_story_material.md` (motivation, pictures, surprises, history in your notes); voice samples from good papers. |
+| `inventory` | Material pack: `00_ground_truth_ledger.json` (every result with its exact statement, hypotheses, source and tier; merged by the program from the scans, so nothing is paraphrased), `00_redlines.md` (your prohibitions: the only rule list writers see), `00_story_material.md` (motivation, pictures, surprises, history in your notes); voice samples from good papers. Unchanged notes reuse their cached scans. |
 | `story` | Traces 4-8 historical steps and verifies each reference itself; writes **`01_story.md`** (one page: the question, its history, why it is open, the answer in words, why it matters, what goes where) and `01_plan.json` (blocks that name results by ledger id only), plus `macros.tex`. `full_auto` pauses here. |
-| `draft` | One author writes the main text block by block in reading order, then title and abstract, then reads it through; the Supplemental Material is written in parallel, rigour first. Each block gets the exact ledger records, never a paraphrase. |
+| `draft` | One author writes the main text block by block in reading order, then reads it all through and writes title and abstract for what is there; the Supplemental Material is written in parallel, rigour first. Each block gets the exact ledger records, never a paraphrase. |
 | `figures` | Builds figures with `journal_fig_theme.py` (`prl` / `nature`) + `verify_figures.py` PyMuPDF & AST gates. |
-| `check` | Report only: one checker per file against the ledger and your original files (scope, quantifiers, attribution, numbers, math), scripted SymPy/numeric checks of core results, a reader check of abstract and introduction, plus the deterministic audits (abstract read alone: acronyms and the 600-character PRL limit; definitions; citations). Writes `03_issues.json` and `audit_reports/01_check_report.md`. |
-| `revise` | The author fixes the issues (or a referee report / your notes): Supplemental Material first, then the main text in reading order, abstract last; smallest edit, keeps the story; may decline a mistaken issue with a reason; math changes are listed for you. |
+| `check` | One pass over the finished text, report only, all checkers in one parallel pool: the whole main text read by one checker and the Supplemental Material in groups of about 60 KB, against the ledger and your original files (scope, quantifiers, attribution, numbers, math); scripted SymPy/numeric checks of up to 4 core results (`--max-numeric-checks`); a reader check of abstract and introduction; plus the deterministic audits (abstract read alone: acronyms and the 600-character PRL limit; definitions; citations). Writes `03_issues.json` and `audit_reports/01_check_report.md`. |
+| `revise` | The author fixes the issues (or a referee report / your notes): Supplemental Material files in parallel, then one author reads the whole main text and fixes it in one pass, abstract last; smallest edit, keeps the story; may decline a mistaken issue with a reason; files with only low-severity issues are skipped (`--revise-low` includes them); math changes are listed for you. Afterwards only the programs re-check. |
 | `cleanup` | Deterministic clean-up only (invisible characters, typography); no LLM rewriting. |
 | `build` | Clean-up, dual `main.tex` + `supplement.tex` compile, layout and leak checks, `\status{...}`-free `main_arxiv.tex`. |
 | `blind_referee` | Specialist, broad reader (who first answers: what, why, how far earlier work got, what is new) and editor, inside a throw-away copy holding only the manuscript, `.bib`/`.bbl`, figure PNGs and audit JSONs. |

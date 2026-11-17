@@ -89,9 +89,14 @@
       },
       "max_numeric_checks": {
         "type": "integer",
-        "default": 12,
+        "default": 4,
         "minimum": 0,
-        "description": "check: how many core results get an independent scripted (SymPy/numerical) check."
+        "description": "check: how many core results (main-text ones first) get an independent scripted (SymPy/numerical) check; 0 = none."
+      },
+      "revise_low": {
+        "type": "boolean",
+        "default": false,
+        "description": "revise: also hand the author files whose issues are all low severity (copy-edit and flow hints); skipped by default."
       },
       "check_backend": {
         "type": "string",

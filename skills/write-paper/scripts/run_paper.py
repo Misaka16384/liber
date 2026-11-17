@@ -66,7 +66,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--plan-path", type=str, help="Optional explicit path to 01_plan.json (default: <paper-dir>/.workflow/01_plan.json).")
     ap.add_argument("--blueprint-path", type=str, help="v2 workspaces only: 01_blueprint.json, read for its figure list.")
     ap.add_argument("--no-pause", dest="pause_after_story", action="store_false", default=None, help="full_auto: do not stop after the story stage for the author to read 01_story.md.")
-    ap.add_argument("--max-numeric-checks", type=int, default=None, help="check: how many core results get a scripted numeric check (default 12).")
+    ap.add_argument("--max-numeric-checks", type=int, default=None, help="check: how many core results get a scripted numeric check (default 4; 0 = none).")
+    ap.add_argument("--revise-low", action="store_true", default=None, help="revise: also revise files whose issues are all low severity (skipped by default).")
     ap.add_argument("--supplement-tex", type=str, help="Optional path to Supplemental Material .tex.")
     ap.add_argument("--figure-specs-path", type=str, help="Optional JSON file describing target figures & captions.")
     ap.add_argument("--repair-instructions", type=str, help="--mode revise/repair: a referee or audit report path, or the instructions as text (default: the latest check report).")
@@ -115,6 +116,7 @@ def main() -> int:
         ("blueprint_path", "blueprint_path"),
         ("pause_after_story", "pause_after_story"),
         ("max_numeric_checks", "max_numeric_checks"),
+        ("revise_low", "revise_low"),
         ("supplement_tex", "supplement_tex"),
         ("figure_specs_path", "figure_specs_path"),
         ("repair_instructions", "repair_instructions"),

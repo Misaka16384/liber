@@ -29,10 +29,12 @@ flowchart LR
   P --> S2["draft：一个作者按块写正文（SM 并行）"]
   S2 --> F["figures（PRL/Nature 主题 + PyMuPDF/AST 门禁）"]
   F --> C["check：只报告（范围、数字、引用、摘要单独可读）"]
-  C --> R["revise：作者按清单最小改动"]
-  R --> C2["再查一遍"] --> B["build（清理、双编译、arXiv 扁平化）"]
-  B --> Ref["blind_referee（隔离盲审，可换厂商）"] --> R
+  C --> R["revise：一个作者通改整篇正文"]
+  R --> C2["程序复检"] --> B["build（清理、双编译、arXiv 扁平化）"]
+  B -.-> Ref["blind_referee，需要时手动跑（隔离盲审，可换厂商）"] -.-> R
 ```
+
+整篇故事先写完，再集中查一次，所有核查员放在同一个并行池里跑。第二遍模型查错和盲审只在你需要时手动运行。
 
 ---
 
@@ -102,7 +104,7 @@ python skills/write-paper/scripts/run_paper.py \
   --genre letter \
   --figure-style prl
 
-# 2. 看完（可直接改）故事线后：起草、作图、查错、修改、复查、编译。agy 写，Claude 查
+# 2. 看完（可直接改）故事线后：起草、作图、查错、修改、程序复检、编译。agy 写，Claude 查
 python skills/write-paper/scripts/run_paper.py \
   --mode draft_and_check \
   --paper-dir ./paper \
@@ -118,7 +120,7 @@ python skills/write-paper/scripts/run_paper.py --mode revise --paper-dir ./paper
   --repair-instructions ./paper/audit_reports/05_blind_referee_report.md
 ```
 
-加 `--no-pause` 可让 `full_auto` 不停顿一路跑完。旧的阶段名仍可用（`blueprint`、`verify`、`citations`、`hygiene`、`repair`、`draft_and_audit`、`audit_polish`）。
+加 `--no-pause` 可让 `full_auto` 不停顿一路跑完。一篇论文第 1 步通常只跑一次（笔记没变的文件不会重新扫描），第 2 步可以反复跑。API 额度允许时加 `--max-parallel 6`（最大 8），所有并行阶段都会更快。旧的阶段名仍可用（`blueprint`、`verify`、`citations`、`hygiene`、`repair`、`draft_and_audit`、`audit_polish`）。
 
 ### 方式三：Antigravity 原生 `run_workflow`
 以 `ScriptPath="<SKILL_DIR>/scripts/paper_workflow.py"` 调用 `run_workflow`，`Args` 见 `scripts/workflow.json`。
@@ -146,12 +148,12 @@ python skills/write-paper/scripts/run_paper.py --mode revise --paper-dir ./paper
 
 | 阶段 (`--mode`) | 做什么 |
 | :--- | :--- |
-| `inventory` | 材料包：`00_ground_truth_ledger.json`（每条结论的原文、前提、数字、出处和层级）、`00_redlines.md`（你的禁令，也是写作者看到的唯一一份规则）、`00_story_material.md`（笔记里的动机、物理图像、意外发现、历史）；从好论文里挑出风格示例段落。 |
+| `inventory` | 材料包：`00_ground_truth_ledger.json`（每条结论的原文、前提、出处和层级；由程序把扫描结果直接合并，不经转述）、`00_redlines.md`（你的禁令，也是写作者看到的唯一一份规则）、`00_story_material.md`（笔记里的动机、物理图像、意外发现、历史）；从好论文里挑出风格示例段落。笔记没变的文件沿用上次的扫描结果。 |
 | `story` | 整理 4–8 步历史脉络，每篇文献由流程自己核实；写 **`01_story.md`**（一页：问题、历史、为什么至今没解决、大白话的答案、意义、什么放正文什么放 SM）和 `01_plan.json`（分块计划，只用台账编号指代结论），以及 `macros.tex`。`full_auto` 在这里停下。 |
-| `draft` | 一个作者按阅读顺序逐块写正文，再写标题和摘要，最后通读一遍；补充材料并行写，严谨优先。每块拿到的是台账原文，不是转述。 |
+| `draft` | 一个作者按阅读顺序逐块写正文，最后一轮先通读全文，再按定稿写标题和摘要；补充材料并行写，严谨优先。每块拿到的是台账原文，不是转述。 |
 | `figures` | 按 `prl` / `nature` 视觉规范作图，过 `verify_figures.py` PyMuPDF 印刷字号 + 矢量碰撞 + AST 门禁。 |
-| `check` | 只报告：每个文件一个核查员，对照台账和原始文件查范围、量词、归属、数字和数学；核心结论跑 SymPy/数值脚本；读者视角检查摘要和引言；再加确定性检查（摘要单独可读：缩写、PRL 600 字符；未定义符号；引用）。输出 `03_issues.json` 和 `audit_reports/01_check_report.md`。 |
-| `revise` | 作者按问题清单（或审稿报告、你的意见）修改：先改补充材料，再按阅读顺序改正文，摘要最后；最小改动、保住叙事；认为是误报可以拒绝并写理由；改动过的公式会列出来给你看。 |
+| `check` | 全文写完后集中查一次，只报告，所有核查员放在同一个并行池：正文由一个核查员整篇通读，补充材料按约 60 KB 一组；对照台账和原始文件查范围、量词、归属、数字和数学；最多 4 个核心结论跑 SymPy/数值脚本（`--max-numeric-checks`）；读者视角检查摘要和引言；再加确定性检查（摘要单独可读：缩写、PRL 600 字符；未定义符号；引用）。输出 `03_issues.json` 和 `audit_reports/01_check_report.md`。 |
+| `revise` | 作者按问题清单（或审稿报告、你的意见）修改：补充材料各文件并行改，正文由一个作者通读后一次改完，摘要最后；最小改动、保住叙事；认为是误报可以拒绝并写理由；只有低优先级问题的文件默认跳过（`--revise-low` 才改）；改动过的公式会列出来给你看。改完只由程序复检。 |
 | `cleanup` | 只做确定性清理（零宽字符、排版符号），没有 LLM 改写。 |
 | `build` | 清理后 `main.tex + supplement.tex` 双编译，检查版面和泄露，输出去掉 `\status{...}` 的 `main_arxiv.tex`。 |
 | `blind_referee` | 小同行、大同行（先回答：问题是什么、为什么重要、前人到哪、新在哪）和编辑三方，在只含稿件、`.bib`/`.bbl`、图片 PNG 和审计 JSON 的临时副本里审稿。 |

@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
-ENGINE_VERSION = "3.0.0"
+ENGINE_VERSION = "3.1.0"
 SKILL_DIR = Path(__file__).resolve().parent.parent
 TOOLS_DIR = SKILL_DIR / "scripts" / "tools"
 REFS_DIR = SKILL_DIR / "references"
@@ -1511,6 +1511,81 @@ async def _ensure_valid_plan(plan_path: Path, ledger_path: Path) -> Dict[str, An
 # Stage 0: material pack
 # ------------------------------------------------------------------------------
 
+SCAN_VERSION = "3.1"  # bump when the scan prompt changes, so cached scans are redone
+
+
+def _file_sha(p: Path) -> str:
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def _match_record_file(rec_file: str, files: Sequence[Path]) -> Optional[Path]:
+    """Which of a scan job's files a returned record belongs to (agents name files in different ways)."""
+    s = str(rec_file or "").replace("\\", "/").strip()
+    for f in files:
+        fp = str(f).replace("\\", "/")
+        if s and (fp == s or fp.endswith("/" + s.lstrip("./")) or s.endswith("/" + f.name) or s == f.name):
+            return f
+    return files[0] if len(files) == 1 else None
+
+
+def build_ledger(records: Sequence[Any]) -> Dict[str, Any]:
+    """Merge scan records into the ledger by program: ids from the source file, statements copied as scanned.
+    (In v3.0 an agent rewrote everything into one JSON; for a real paper that was tens of thousands of output
+    tokens, the slowest call of the whole run, and another place where a result could be paraphrased.)"""
+    claims: List[Dict[str, Any]] = []
+    cited: List[str] = []
+    notations: List[str] = []
+    used: set = set()
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        src = str(rec.get("file") or "notes")
+        stem = re.sub(r"[^A-Za-z0-9]+", "-", Path(src.replace("\\", "/")).stem).strip("-")[:24] or "src"
+        for k, c in enumerate(rec.get("claims") or [], 1):
+            c = c if isinstance(c, dict) else {"statement": str(c)}
+            cid = f"{stem}-{k}"
+            while cid in used:
+                cid += "b"
+            used.add(cid)
+            lines = str(c.get("lines") or "").strip()
+            claims.append({
+                "id": cid,
+                "kind": str(c.get("kind") or "result"),
+                "statement": str(c.get("statement") or c.get("text") or json.dumps(c, ensure_ascii=False)),
+                "hypotheses": c.get("hypotheses") or "",
+                "source": f"{src}:{lines}" if lines else src,
+                "tier": "support",
+            })
+        for x in rec.get("cited_works") or []:
+            if str(x) not in cited:
+                cited.append(str(x))
+        for x in rec.get("notations") or []:
+            if str(x) not in notations:
+                notations.append(str(x))
+    return {"claims": claims, "cited_works": cited, "notations": notations}
+
+
+def apply_judgement(ledger: Dict[str, Any], judgement: Dict[str, Any]) -> Dict[str, Any]:
+    """Tiers and duplicates decided by the judging agent, applied by program (statements are never rewritten)."""
+    claims = list(ledger.get("claims") or [])
+    by_id = {c["id"]: c for c in claims}
+    core = {str(x) for x in judgement.get("core") or [] if str(x) in by_id}
+    drop: Dict[str, str] = {}
+    for grp in judgement.get("duplicates") or []:
+        ids = [str(x) for x in (grp or []) if str(x) in by_id]
+        for d in ids[1:]:
+            if d != ids[0] and ids[0] not in drop:
+                drop[d] = ids[0]
+    for d, keep in drop.items():
+        by_id[keep].setdefault("also_in", []).append(by_id[d]["source"])
+        if d in core:
+            core.add(keep)
+    kept = [c for c in claims if c["id"] not in drop]
+    for c in kept:
+        c["tier"] = "core" if c["id"] in core else "support"
+    return {**ledger, "claims": kept}
+
+
 async def run_inventory(paths: Dict[str, Path]) -> Dict[str, Any]:
     wf = paths["wf"]
     args = _wf_args()
@@ -1523,24 +1598,49 @@ async def run_inventory(paths: Dict[str, Path]) -> Dict[str, Any]:
     if skipped_sources:
         log(f"Stage 0: skipped {len(skipped_sources)} source paths (missing, or too large to be notes): {skipped_sources[:8]}")
 
-    # One scan agent per authority file; the other sources are packed into ~60 KB chunks. Refuse to fan out
-    # beyond max_scan_agents instead of silently launching hundreds of paid agents on a data directory.
-    scan_jobs: List[Tuple[List[Path], bool]] = [([f], True) for f in authority_files] + [(c, False) for c in chunk_source_files(other_files)]
+    # Unchanged files are not scanned again: their records come from the cache.
+    cache_path = wf / "00_scan_cache.json"
+    try:
+        cache = json.loads(read_text_safe(cache_path) or "{}")
+    except json.JSONDecodeError:
+        cache = {}
+    if cache.get("version") != SCAN_VERSION:
+        cache = {"version": SCAN_VERSION, "files": {}}
+    all_inputs = authority_files + other_files
+    shas = {str(f.resolve()): _file_sha(f) for f in all_inputs}
+    cache["files"] = {k: v for k, v in (cache.get("files") or {}).items() if k in shas}
+
+    def fresh(f: Path) -> bool:
+        ent = cache["files"].get(str(f.resolve()))
+        return bool(ent) and ent.get("sha") == shas[str(f.resolve())]
+
+    stale_auth = [f for f in authority_files if not fresh(f)]
+    stale_other = [f for f in other_files if not fresh(f)]
+
+    # One scan agent per changed authority file; other changed sources are packed into ~60 KB chunks. Refuse to fan
+    # out beyond max_scan_agents instead of silently launching hundreds of paid agents on a data directory.
+    scan_jobs: List[Tuple[List[Path], bool]] = [([f], True) for f in stale_auth] + [(c, False) for c in chunk_source_files(stale_other)]
     max_jobs = int(_STATE.get("max_scan_agents") or 24)
     if len(scan_jobs) > max_jobs:
         raise RuntimeError(
-            f"Stage 0 would launch {len(scan_jobs)} scan agents for {len(authority_files)} authority + {len(other_files)} source files "
+            f"Stage 0 would launch {len(scan_jobs)} scan agents for {len(stale_auth)} authority + {len(stale_other)} source files "
             f"(limit max_scan_agents={max_jobs}). Narrow --source-paths to the notes/reports that matter (data directories are not "
             f"needed), or raise --max-scan-agents deliberately."
         )
 
     phase("Stage 0: Material Pack (results ledger, red lines, story material, voice samples)")
+    if len(all_inputs) > len(stale_auth) + len(stale_other):
+        log(f"Stage 0: {len(all_inputs) - len(stale_auth) - len(stale_other)} unchanged source files reuse their cached scans")
     profile_path = wf / "00_style_profile.json"
-    if exemplar_paths:
+    ex_key = sorted([str(Path(x).resolve()), _file_sha(Path(x))] for x in exemplar_paths if Path(x).is_file())
+    try:
+        has_samples = bool(json.loads(read_text_safe(profile_path) or "{}").get("categorized_exemplars"))
+    except json.JSONDecodeError:
+        has_samples = False
+    if exemplar_paths and not (cache.get("exemplars") == ex_key and has_samples):
         rc, _, _, _ = run_tool("style_metrics.py", ["profile", "--inputs", *exemplar_paths, "--out", str(profile_path), "--no-lm"], allow_fail=True)
         log(f"style_metrics.py profile exited {rc}")
-    ensure_default_profile(paths)
-    if exemplar_paths:
+        ensure_default_profile(paths)
         vet_res = await dispatch_agent(
             f"Read the exemplar papers {exemplar_paths}. Copy verbatim 5 to 8 paragraphs worth imitating into `{profile_path}`, under "
             f"`categorized_exemplars`: an object with the keys `opening`, `history`, `result_statement`, `mechanism` and `discussion`, each a "
@@ -1550,34 +1650,39 @@ async def run_inventory(paths: Dict[str, Path]) -> Dict[str, Any]:
             stage_name="inventory",
         )
         log(f"Voice samples curated: {vet_res}")
+        cache["exemplars"] = ex_key
+    ensure_default_profile(paths)
 
+    claim_item = {
+        "type": "object",
+        "properties": {"statement": {"type": "string"}, "hypotheses": {"type": "string"}, "kind": {"type": "string"}, "lines": {"type": "string"}},
+        "required": ["statement"],
+    }
     scan_schema = {
         "type": "object",
         "properties": {
             "file": {"type": "string"},
-            "is_authority": {"type": "boolean"},
-            "claims": {"type": "array", "items": {"type": "object"}},
-            "locked_numbers": {"type": "array", "items": {"type": "object"}},
+            "claims": {"type": "array", "items": claim_item},
             "redlines_and_decisions": {"type": "array", "items": {"type": "string"}},
             "story_material": {"type": "array", "items": {"type": "string"}},
             "notations": {"type": "array", "items": {"type": "string"}},
-            "domain_terms": {"type": "array", "items": {"type": "string"}},
             "cited_works": {"type": "array", "items": {"type": "string"}},
         },
-        "required": ["file", "claims", "notations"],
+        "required": ["file", "claims"],
     }
     scan_list_schema = {"type": "object", "properties": {"records": {"type": "array", "items": scan_schema}}, "required": ["records"]}
     job_results = await run_batched(
         scan_jobs,
         lambda job: dispatch_agent(
             f"Read each of these files thoroughly (authority_doc={job[1]}): {[str(p) for p in job[0]]}.\n"
-            f"Return one record per file with:\n"
-            f"1. `claims`: every result (theorem, lemma, proposition, numerical finding) with its exact statement, its hypotheses and quantifiers "
-            f"(`with multiplicity`, translation invariance, finite range, boundary conditions) and its line span.\n"
-            f"2. `locked_numbers`: exact values, each with the exact Hamiltonian / observable / residual it belongs to (never conflate bounds or models).\n"
-            f"3. `redlines_and_decisions`: the author's decisions and prohibitions (what must not be claimed or mentioned), verbatim.\n"
-            f"4. `story_material`: why the author cared, physical pictures and analogies, surprises, history and prior work mentioned, open questions (with line spans).\n"
-            f"5. `notations`, `domain_terms`, `cited_works`.",
+            f"Return one record per file (`file` = its path as given) with:\n"
+            f"1. `claims`: every result (theorem, lemma, proposition, numerical value or finding), each with its exact `statement`, its "
+            f"`hypotheses` and quantifiers (`with multiplicity`, translation invariance, finite range, boundary conditions), a `kind` "
+            f"(theorem / proposition / number / definition / observation) and its `lines`. A number's statement names the exact Hamiltonian, "
+            f"observable or residual it belongs to (never conflate bounds or models).\n"
+            f"2. `redlines_and_decisions`: the author's decisions and prohibitions (what must not be claimed or mentioned), verbatim.\n"
+            f"3. `story_material`: why the author cared, physical pictures and analogies, surprises, history and prior work mentioned, open questions (with line spans).\n"
+            f"4. `notations` and `cited_works`.",
             schema=scan_list_schema,
             role=f"Scan {job[0][0].name}" + (f" (+{len(job[0]) - 1})" if len(job[0]) > 1 else ""),
             stage_name="inventory",
@@ -1585,9 +1690,21 @@ async def run_inventory(paths: Dict[str, Path]) -> Dict[str, Any]:
             read_only=True,
         ),
     ) if scan_jobs else []
-    scans: List[Any] = []
-    for jr in job_results:
-        scans.extend(_require_fields(jr, ["records"], "Stage 0 scan")["records"])
+    unmatched: List[Any] = []
+    for job, jr in zip(scan_jobs, job_results):
+        matched: Dict[str, List[Any]] = {}
+        for rec in _require_fields(jr, ["records"], "Stage 0 scan")["records"]:
+            f = _match_record_file(str(rec.get("file") or ""), job[0]) if isinstance(rec, dict) else None
+            if f is None:
+                unmatched.append(rec)  # used now; its files stay uncached and are scanned again next time
+            else:
+                matched.setdefault(str(f.resolve()), []).append(rec)
+        for key, recs in matched.items():
+            cache["files"][key] = {"sha": shas[key], "records": recs}
+    cache["judged"] = cache.get("judged") if not scan_jobs else False
+    cache_path.write_text(json.dumps(cache, indent=1, ensure_ascii=False), encoding="utf-8")
+
+    scans = [r for f in all_inputs for r in (cache["files"].get(str(f.resolve())) or {}).get("records", [])] + unmatched
     scans_path = wf / "00_scans.json"
     scans_path.write_text(json.dumps(scans, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -1595,38 +1712,57 @@ async def run_inventory(paths: Dict[str, Path]) -> Dict[str, Any]:
     redlines_path = wf / "00_redlines.md"
     story_path = wf / "00_story_material.md"
     conflicts_path = wf / "00_conflicts_report.md"
-    synth_res = await dispatch_agent(
-        f"Synthesize the {len(scans)} records in `{scans_path}` (read the whole file) into four files:\n"
-        f"1. `{ledger_path}`: a JSON object whose `claims` key lists every result as {{\"id\", \"kind\" (theorem / proposition / numerical / "
-        f"definition / observation), \"statement\" (exact, with all hypotheses and quantifiers), \"numbers\" (exact values with the object each "
-        f"belongs to), \"source\" (file:lines), \"tier\": \"core\" (a headline or main-text candidate) or \"support\"}}; also keep `cited_works` and `notations`.\n"
-        f"2. `{redlines_path}`: the author's decisions and prohibitions, one per line, exact wording, with the source. Keep it short: it is the "
-        f"only rule list the writers see.\n"
-        f"3. `{story_path}`: the story material (motivation, physical pictures, surprises, history and prior work as the notes give it, "
-        f"open questions), with source pointers.\n"
-        f"4. `{conflicts_path}`: notation and convention conflicts between the sources (signs, normalisations, symbols).",
+    hints_path = wf / "00_cited_seed_hints.json"
+    outputs = (ledger_path, redlines_path, story_path, conflicts_path, hints_path)
+    if cache.get("judged") and all(p.exists() for p in outputs):
+        log("Stage 0: sources unchanged since the last run; the material pack is reused as it is")
+        hints = json.loads(read_text_safe(hints_path) or "[]")
+        return {"ledger": str(ledger_path), "redlines": str(redlines_path), "story_material": str(story_path), "conflicts": str(conflicts_path),
+                "profile": str(profile_path), "cited_seed_hints": hints, "skipped_sources": skipped_sources, "rescanned_jobs": 0, "reused": True}
+
+    ledger = build_ledger(scans)
+    ledger_path.write_text(json.dumps(ledger, indent=2, ensure_ascii=False), encoding="utf-8")
+    judgement = await dispatch_agent(
+        f"The workflow merged {len(ledger['claims'])} results from the notes into `{ledger_path}` (ids assigned, statements copied as "
+        f"scanned). Read it and the scan records in `{scans_path}`. Do not rewrite the ledger. Write three short files:\n"
+        f"1. `{redlines_path}`: the author's decisions and prohibitions, one per line, exact wording, with the source. Keep it short: it is "
+        f"the only rule list the writers see.\n"
+        f"2. `{story_path}`: the story material (motivation, physical pictures, surprises, history and prior work as the notes give it, open "
+        f"questions), with source pointers.\n"
+        f"3. `{conflicts_path}`: notation and convention conflicts between the sources (signs, normalisations, symbols).\n"
+        f"Then answer with `core` (ids of the results that could headline the paper or belong in its main text), `duplicates` (groups of ids "
+        f"that state the same result, the most complete statement first) and `cited_seed_hints` (works the notes cite, as title words, first "
+        f"author, year).",
         schema={
             "type": "object",
             "properties": {
-                "claim_count": {"type": "integer"},
-                "conflict_count": {"type": "integer"},
+                "core": {"type": "array", "items": {"type": "string"}},
+                "duplicates": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
                 "cited_seed_hints": {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["claim_count", "conflict_count", "cited_seed_hints"],
+            "required": ["core", "duplicates", "cited_seed_hints"],
         },
-        role="Synthesize Material Pack",
+        role="Judge Material Pack",
         stage_name="inventory",
+        tier="heavy",
     )
-    synth_res = _require_fields(synth_res, ["claim_count", "conflict_count"], "Stage 0 synthesis")
-    hints = [str(h) for h in (synth_res.get("cited_seed_hints") or [])]
+    judgement = _require_fields(judgement, ["core", "duplicates"], "Stage 0 judgement")
+    ledger = apply_judgement(ledger, judgement)
+    ledger_path.write_text(json.dumps(ledger, indent=2, ensure_ascii=False), encoding="utf-8")
+    hints = [str(h) for h in (judgement.get("cited_seed_hints") or [])]
     # Persisted: the story stage usually runs as a separate process after the author looked at the pack.
-    (wf / "00_cited_seed_hints.json").write_text(json.dumps(hints, indent=2, ensure_ascii=False), encoding="utf-8")
-    for must in (ledger_path, redlines_path, story_path):
+    hints_path.write_text(json.dumps(hints, indent=2, ensure_ascii=False), encoding="utf-8")
+    for must in (redlines_path, story_path):
         if not must.exists():
-            raise RuntimeError(f"Stage 0 synthesis did not write {must}")
-    log(f"Stage 0 complete: {synth_res['claim_count']} results, {synth_res['conflict_count']} notation conflicts")
+            raise RuntimeError(f"Stage 0 judgement did not write {must}")
+    if not conflicts_path.exists():
+        conflicts_path.write_text("No notation conflicts reported.\n", encoding="utf-8")
+    cache["judged"] = True
+    cache_path.write_text(json.dumps(cache, indent=1, ensure_ascii=False), encoding="utf-8")
+    n_core = sum(1 for c in ledger["claims"] if c["tier"] == "core")
+    log(f"Stage 0 complete: {len(ledger['claims'])} results ({n_core} core) from {len(scans)} records; {len(scan_jobs)} scan jobs this run")
     return {"ledger": str(ledger_path), "redlines": str(redlines_path), "story_material": str(story_path), "conflicts": str(conflicts_path),
-            "profile": str(profile_path), "cited_seed_hints": hints, "skipped_sources": skipped_sources}
+            "profile": str(profile_path), "cited_seed_hints": hints, "skipped_sources": skipped_sources, "rescanned_jobs": len(scan_jobs), "reused": False}
 
 
 # ------------------------------------------------------------------------------
@@ -1842,23 +1978,19 @@ def main_block_prompt(b: Dict[str, Any], i: int, n: int, done: Sequence[str], pa
     )
 
 
-def abstract_prompt(main_tex: Path, main_files: Sequence[str], genre: str) -> str:
+def finish_prompt(main_tex: Path, main_files: Sequence[str], paper_dir: Path, genre: str) -> str:
+    """The author's last turn: read the whole main text through, then write the title and the abstract for what is there."""
     limit = ABSTRACT_LIMITS.get(genre)
     lim = f"The venue allows at most {limit} characters including spaces (counted automatically afterwards)." if limit else "Aim for 150 to 220 words."
-    return (
-        f"All main-text blocks are written. Now write the title and the abstract in `{main_tex}`, replacing the placeholders. "
-        "The abstract tells the story in miniature: the context and the question, the answer in words, and why it matters. "
-        f"Explain inside the abstract every symbol and acronym it uses, and prefer words to symbols. {lim} "
-        f"Make sure `{main_tex}` inputs `macros.tex` and the block files in this order: {', '.join(main_files)}. "
-        "Leave the author list and the acknowledgments placeholders for the human author."
-    )
-
-
-def readthrough_prompt(main_tex: Path, main_files: Sequence[str], paper_dir: Path) -> str:
     files = ", ".join(f"`{paper_dir / f}`" for f in main_files)
     return (
-        f"Read the whole main text in order: `{main_tex}`, then {files}. Smooth the transitions, remove repetition, and make the "
-        "introduction promise exactly what the body delivers. Keep the edits small and add no new results. Reply with a short list of what you changed."
+        f"All main-text blocks are written. 1. Read the whole main text in order ({files}). Smooth the transitions, remove repetition, "
+        "and make the introduction promise exactly what the body delivers; keep these edits small and add no new results. "
+        f"2. Then write the title and the abstract in `{main_tex}`, replacing the placeholders, for the text as it now stands. The abstract "
+        "tells the story in miniature: the context and the question, the answer in words, and why it matters. Explain inside the abstract "
+        f"every symbol and acronym it uses, and prefer words to symbols. {lim} "
+        f"Make sure `{main_tex}` inputs `macros.tex` and the block files in this order: {', '.join(main_files)}. "
+        "Leave the author list and the acknowledgments placeholders for the human author. Reply with a short list of what you changed."
     )
 
 
@@ -1918,8 +2050,7 @@ async def run_draft(paths: Dict[str, Path]) -> Dict[str, Any]:
         for i, b in enumerate(main_blocks, 1):
             results["main"].append(await call_persistent_handle(author, main_block_prompt(b, i, len(main_blocks), done, paper_dir, index), BLOCK_SCHEMA))
             done.append(b["file"])
-        await call_persistent_handle(author, abstract_prompt(main_tex, main_files, genre), {"type": "string"})
-        await call_persistent_handle(author, readthrough_prompt(main_tex, main_files, paper_dir), {"type": "string"})
+        await call_persistent_handle(author, finish_prompt(main_tex, main_files, paper_dir, genre), {"type": "string"})
 
     async def write_sm() -> None:
         if sm_blocks:
@@ -2166,21 +2297,21 @@ def issues_from_citations(paper_dir: Path, rep: Optional[Dict[str, Any]]) -> Lis
 def issues_from_scans(paper_dir: Path, wm: Optional[Dict[str, Any]], sty: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for fr in (wm or {}).get("files") or []:
-        rel = _paper_rel(paper_dir, fr.get("file") or "") or ""
+        rel = resolve_paper_file(paper_dir, fr.get("file") or "") or ""
         for h in (fr.get("copyedit_issues") or []) + (fr.get("ai_slop_hits") or []):
             out.append({"file": rel, "location": str(h.get("line", "")) if isinstance(h, dict) else "",
                         "problem": "copy-edit: " + json.dumps(h, ensure_ascii=False)[:240], "severity": "low", "kind": "copyedit", "source": "clean_watermarks"})
     for fr in (sty or {}).get("files") or []:
         if fr.get("staccato_warning"):
-            rel = _paper_rel(paper_dir, fr.get("file") or "") or ""
+            rel = resolve_paper_file(paper_dir, fr.get("file") or "") or ""
             out.append({"file": rel, "location": "", "problem": f"runs of very short sentences: {json.dumps(fr.get('staccato_warning'), ensure_ascii=False)[:240]}",
                         "severity": "low", "kind": "flow", "source": "style_metrics"})
     return out
 
 
-async def citation_pass(paths: Dict[str, Path]) -> Optional[Dict[str, Any]]:
+async def citation_pass(paths: Dict[str, Path], agents: bool = True) -> Optional[Dict[str, Any]]:
     """Reference metadata only: audit the .bib, resolve `\\cite{TODO:...}` placeholders that can be verified, repair
-    wrong metadata in refs.bib. Prose is never rewritten here."""
+    wrong metadata in refs.bib. Prose is never rewritten here. agents=False: the audit alone (cached API answers)."""
     paper_dir = paths["paper"]
     wf = paths["wf"]
     refs_bib = paper_dir / "refs.bib"
@@ -2193,24 +2324,23 @@ async def citation_pass(paths: Dict[str, Path]) -> Optional[Dict[str, Any]]:
     cite_json = wf / "04_citation_audit.json"
     cite_md = paths["audit"] / "02_citation_audit.md"
     audit_cli = ["audit", "--tex-dir", str(paper_dir), "--bib", str(refs_bib), "--cache", str(bib_cache), "--json-out", str(cite_json), "--md-out", str(cite_md)]
-    _, _, _, rep = run_tool("verify_citations.py", audit_cli + ["--fix-braces", "--upgrade-preprints"], allow_fail=True)
-    if rep is None:
-        return None
+    _, _, _, rep = run_tool("verify_citations.py", audit_cli + (["--fix-braces", "--upgrade-preprints"] if agents else []), allow_fail=True)
+    if rep is None or not agents:
+        return rep
     vc = f"{resolve_python_exe()} {TOOLS_DIR / 'verify_citations.py'} verify-entry"
     todo_list = rep.get("todo_placeholders") or []
     if todo_list:
-        await run_batched(
-            todo_list,
-            lambda td: dispatch_agent(
-                f"Resolve the placeholder citation `{td['key']}` at {td['locations']} inside `{paper_dir}`.\n"
-                f"1. `{vc} --query \"...\"` lists candidates only (never verified).\n"
-                f"2. Confirm the right one with `{vc} --doi <doi> --title \"<exact title>\"` (or `--arxiv <id>`).\n"
-                f"3. ONLY if step 2 printed verified=true: add its BibTeX to `{refs_bib}` (keep the other entries, @string and comments untouched) "
-                f"and replace the placeholder key in the .tex. Otherwise leave the placeholder and report resolved=false. Change no other text.",
-                schema={"type": "object", "properties": {"placeholder": {"type": "string"}, "resolved": {"type": "boolean"}, "new_key": {"type": "string"}}, "required": ["placeholder", "resolved"]},
-                role=f"Resolve {td['key'][:26]}",
-                stage_name="check",
-            ),
+        # One agent for all placeholders: each is a short lookup, and one agent per placeholder was mostly start-up time.
+        await dispatch_agent(
+            f"Resolve these placeholder citations inside `{paper_dir}`: {json.dumps(todo_list, ensure_ascii=False)}.\n"
+            f"For each one: 1. `{vc} --query \"...\"` lists candidates only (never verified). 2. Confirm the right candidate with "
+            f"`{vc} --doi <doi> --title \"<exact title>\"` (or `--arxiv <id>`). 3. ONLY if step 2 printed verified=true: add its BibTeX to "
+            f"`{refs_bib}` (keep the other entries, @string and comments untouched) and replace the placeholder key in the .tex. Otherwise "
+            f"leave that placeholder. Change no other text.",
+            schema={"type": "object", "properties": {"resolved": {"type": "array", "items": {"type": "string"}}, "unresolved": {"type": "array", "items": {"type": "string"}}},
+                    "required": ["resolved", "unresolved"]},
+            role="Resolve Citation Placeholders",
+            stage_name="check",
         )
     bad_bib = [e for e in rep.get("entries", []) if e.get("is_cited") and e.get("status") in _BAD_BIB_STATUSES]
     bbl_iss = rep.get("bbl_issues", []) + rep.get("bib_hygiene_issues", []) + [{"bib_parse_error": pe} for pe in rep.get("bib_parse_errors", [])]
@@ -2239,19 +2369,76 @@ def _scripted_check_guarded(prompt: str, role: str) -> Any:
     return _go()
 
 
+DEFAULT_NUMERIC_CHECKS = 4
+CHECK_GROUP_BYTES = 60_000
+
+
 def _pick_numeric_claims(ledger_path: Path, plan: Optional[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    """Core results that the main text uses come first (in reading order), then the other core results."""
     claims = _ledger_claims(ledger_path)
-    core = [c for c in claims if str(c.get("tier") or "").lower() == "core"]
-    if not core and plan:
-        main_ids = {str(i) for b in plan["blocks"] if b.get("part") == "main" for i in (b.get("claim_ids") or [])}
-        core = [c for c in claims if str(c.get("id")) in main_ids]
-    core = core or claims
-    if len(core) > limit:
-        log(f"[check] {len(core)} core results; scripted checks run on the first {limit} (raise max_numeric_checks to check more)")
-    return core[:limit]
+    by_id = {str(c.get("id")): c for c in claims}
+    core_ids = {str(c.get("id")) for c in claims if str(c.get("tier") or "").lower() == "core"}
+    main_ids = [str(i) for b in (plan or {}).get("blocks", []) if b.get("part") == "main" for i in (b.get("claim_ids") or [])]
+    order: List[str] = []
+    for cid in main_ids + [str(c.get("id")) for c in claims]:
+        if cid in by_id and cid not in order and (not core_ids or cid in core_ids):
+            order.append(cid)
+    if len(order) > limit:
+        log(f"[check] {len(order)} candidate results; scripted checks run on the first {limit} (max_numeric_checks)")
+    return [by_id[c] for c in order[:limit]]
 
 
-async def run_check(paths: Dict[str, Path]) -> Dict[str, Any]:
+def check_groups(paper_dir: Path, budget: int = CHECK_GROUP_BYTES) -> List[Tuple[str, List[str]]]:
+    """The main text is one group, read in order by one checker (a story is checked as a whole, and an issue is
+    pinned to the right file). Every other .tex file is packed, in reading order, into groups of about `budget` bytes."""
+    main = part_files(paper_dir, "main.tex")
+    groups: List[Tuple[str, List[str]]] = [("main text", main)] if main else []
+    supp = resolve_supplement_path(paper_dir)
+    supp_order = part_files(paper_dir, supp.name) if supp else []
+    rest = [str(f.relative_to(paper_dir)).replace("\\", "/") for f in list_editable_tex(paper_dir)]
+    rest = [r for r in rest if r not in main]
+    rest.sort(key=lambda r: (supp_order.index(r) if r in supp_order else len(supp_order), r))
+    packs: List[List[str]] = []
+    cur: List[str] = []
+    size = 0
+    for r in rest:
+        s = (paper_dir / r).stat().st_size if (paper_dir / r).exists() else 0
+        if cur and size + s > budget:
+            packs.append(cur)
+            cur, size = [], 0
+        cur.append(r)
+        size += s
+    if cur:
+        packs.append(cur)
+    for k, pack in enumerate(packs, 1):
+        groups.append((f"supplement {k}" if len(packs) > 1 else "supplement", pack))
+    return groups
+
+
+def _write_check_report(paths: Dict[str, Path], issues: List[Dict[str, Any]], suffix: str, title: str, note: str) -> Tuple[Path, Path, Dict[str, int]]:
+    counts = {s: sum(1 for i in issues if i["severity"] == s) for s in SEVERITIES}
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    issues_path = paths["wf"] / f"03_issues{suffix}.json"
+    issues_path.write_text(json.dumps({"generated": stamp, "counts": counts, "issues": issues}, indent=2, ensure_ascii=False), encoding="utf-8")
+    md = [f"# {title}", "", f"- Generated: {stamp}", f"- Issues: {len(issues)} (high {counts['high']}, medium {counts['medium']}, low {counts['low']})", f"- {note}", ""]
+    by_file: Dict[str, List[Dict[str, Any]]] = {}
+    for it in issues:
+        by_file.setdefault(it.get("file") or "(no file)", []).append(it)
+    for f, items in by_file.items():
+        md += [f"## {f}", ""]
+        for it in items:
+            quote = f" — \"{str(it['quote'])[:160]}\"" if it.get("quote") else ""
+            md.append(f"- **{it['severity']}** [{it.get('source', '')}] {it.get('location', '')}{quote}: {it['problem']}")
+        md.append("")
+    report = paths["audit"] / f"01_check_report{suffix}.md"
+    report.write_text("\n".join(md), encoding="utf-8")
+    return issues_path, report, counts
+
+
+async def run_check(paths: Dict[str, Path], llm: bool = True) -> Dict[str, Any]:
+    """All checks in one pass over the finished text. Nothing here rewrites prose (the citation step only fixes
+    refs.bib metadata and verifiable `\\cite{TODO:...}` keys). llm=False: the deterministic checks alone, used
+    after revise instead of a second full check."""
     paper_dir = paths["paper"]
     wf = paths["wf"]
     audit_dir = paths["audit"]
@@ -2261,14 +2448,14 @@ async def run_check(paths: Dict[str, Path]) -> Dict[str, Any]:
     plan, _ = validate_plan(_plan_path())
     main_tex = paper_dir / "main.tex"
     auth_files = [str(p) for p in collect_source_files(args.get("authority_paths") or args.get("source_paths") or [])]
-    phase("Stage 3: Check (reports issues; the author fixes them in revise)")
+    phase("Stage 3: Check (one pass over the whole text; reports only)" if llm else "Deterministic check after revise")
 
     defs_cli = ["--main", str(main_tex), "--json-out", str(wf / "03_tex_defs_audit.json"), "--md-out", str(audit_dir / "00_tex_defs_audit.md")]
     if ABSTRACT_LIMITS.get(genre):
         defs_cli += ["--abstract-max-chars", str(ABSTRACT_LIMITS[genre])]
     _, _, _, defs = run_tool("audit_tex_defs.py", defs_cli, allow_fail=True)
     issues: List[Dict[str, Any]] = issues_from_defs(paper_dir, defs)
-    issues += issues_from_citations(paper_dir, await citation_pass(paths))
+    issues += issues_from_citations(paper_dir, await citation_pass(paths, agents=llm))
     tex_files = list_editable_tex(paper_dir)
     _, _, _, wm = run_tool("clean_watermarks.py", ["--paths", str(paper_dir), "--json-out", str(wf / "05_clean_wm.json")], allow_fail=True)
     sty = None
@@ -2277,83 +2464,62 @@ async def run_check(paths: Dict[str, Path]) -> Dict[str, Any]:
                                                      "--json-out", str(wf / "05_stylometrics.json"), "--md-out", str(audit_dir / "03_stylometrics_report.md"), "--no-lm"], allow_fail=True)
     issues += issues_from_scans(paper_dir, wm, sty)
 
+    if not llm:
+        issues = dedupe_issues(issues)
+        issues_path, report, counts = _write_check_report(paths, issues, "_after_revise", "Deterministic Check After Revise",
+                                                          "Programs only (definitions, abstract read alone, citations, copy-edit scans); run mode=check for a full check.")
+        log(f"Deterministic check after revise: {len(issues)} issues (high {counts['high']}) -> {report}")
+        return {"issues": len(issues), **counts, "issues_json": str(issues_path), "report": str(report)}
+
     truth = (f"the ledger `{ledger_path}` and the original notes and authority files {auth_files}. Do not use `01_story.md`, `01_plan.json` "
              f"or the old `01_blueprint.json` as evidence")
-    rels = [str(f.relative_to(paper_dir)).replace("\\", "/") for f in tex_files]
-    scope_reports = await run_batched(
-        rels,
-        lambda rel: dispatch_agent(
-            f"Check `{paper_dir / rel}` against {truth}.\n"
-            f"Report every place where the text (a) states a result with a wider scope, or weaker or stronger hypotheses or quantifiers, than "
-            f"the source; (b) attributes something to the wrong work or misdescribes a cited work (metadata and abstracts of cited works: "
-            f"`{wf / '04_api_bib_cache.json'}`); (c) gives a number that differs from the source or attaches it to the wrong model or observable; "
-            f"(d) contains a mathematical error. Report nothing about style or wording. In the abstract and the introduction a result may be "
-            f"told in words with its technical hypotheses left to the body: report only what is false or stronger than the source there, "
-            f"not a missing qualifier.\n{ISSUE_FORMAT}",
-            schema=ISSUE_SCHEMA,
-            role=f"Check {Path(rel).name}",
-            stage_name="check",
-            read_only=True,
-            tier="heavy",
-        ),
+    scope_rules = (
+        f"Report every place where the text (a) states a result with a wider scope, or weaker or stronger hypotheses or quantifiers, than "
+        f"the source; (b) attributes something to the wrong work or misdescribes a cited work (metadata and abstracts of cited works: "
+        f"`{wf / '04_api_bib_cache.json'}`); (c) gives a number that differs from the source or attaches it to the wrong model or observable; "
+        f"(d) contains a mathematical error. Report nothing about style or wording. In the abstract and the introduction a result may be "
+        f"told in words with its technical hypotheses left to the body: report only what is false or stronger than the source there, "
+        f"not a missing qualifier."
     )
-    for rel, rep in zip(rels, scope_reports):
-        issues += collect_issues(paper_dir, [rep], f"scope:{rel}")
+    jobs: List[Tuple[str, Callable[[], Any]]] = []
+    for label, files in check_groups(paper_dir):
+        listing = ", ".join(f"`{paper_dir / f}`" for f in files)
+        jobs.append((f"scope:{label}", lambda label=label, files=files, listing=listing: dispatch_agent(
+            f"Check the {label} of the manuscript in `{paper_dir}`: read {listing} in this order, as one text, against {truth}.\n{scope_rules}\n"
+            f"Give each issue the file it is in (one of: {', '.join(files)}).\n{ISSUE_FORMAT}",
+            schema=ISSUE_SCHEMA, role=f"Check {label}", stage_name="check", read_only=True, tier="heavy")))
 
     max_checks = args.get("max_numeric_checks")
-    numeric_claims = _pick_numeric_claims(ledger_path, plan, 12 if max_checks is None else int(max_checks))  # 0 = none
-    numeric_reports = await run_batched(
-        numeric_claims,
-        lambda c: _scripted_check_guarded(
+    for c in _pick_numeric_claims(ledger_path, plan, DEFAULT_NUMERIC_CHECKS if max_checks is None else int(max_checks)):  # 0 = none
+        jobs.append((f"numeric:{c.get('id', '?')}", lambda c=c: _scripted_check_guarded(
             f"Independently check this ledger result as the manuscript in `{paper_dir}` states it:\n{json.dumps(c, ensure_ascii=False)}\n"
             f"Write and run a standalone script with `{resolve_python_exe()}` in `{paths['verify_scripts']}` that tests the identity or number "
             f"and its boundary cases. Do not edit manuscript files. Report an issue only where the manuscript's statement fails your check, "
             f"and cite the script as evidence.\n{ISSUE_FORMAT}",
-            f"Numeric {c.get('id', '?')}",
-        ),
-    )
-    for c, rep in zip(numeric_claims, numeric_reports):
-        issues += collect_issues(paper_dir, [rep], f"numeric:{c.get('id', '?')}")
+            f"Numeric {c.get('id', '?')}")))
 
     intro = next((b["file"] for b in (plan or {}).get("blocks", []) if b.get("part") == "main"), None)
     intro_txt = f" and the introduction `{paper_dir / intro}`" if intro else " and its introduction (the first main-text section it inputs)"
     math_txt = f" The abstract uses these math expressions: {json.dumps((defs or {}).get('abstract_math') or [], ensure_ascii=False)}." if (defs or {}).get("abstract_math") else ""
-    reader = await dispatch_agent(
+    jobs.append(("reader", lambda: dispatch_agent(
         f"Read the abstract in `{main_tex}`{intro_txt} as a physicist from a neighbouring field would.{math_txt}\n"
         f"Report: (1) every sentence of the abstract or the introduction that is false or claims more than the results support (compare "
         f"with the ledger `{ledger_path}`), severity high. These parts tell results in words and leave technical hypotheses (system size, "
         f"boundary conditions, parameter ranges) to the body; a missing qualifier is not an issue unless the sentence is false without it. "
-        f"(2) every symbol or acronym in the abstract that the abstract itself does not explain, "
-        f"severity medium; (3) one issue for each of these questions the introduction leaves unanswered, severity medium: what is the "
-        f"question, why does it matter, how far did earlier work get, what is new here.\n{ISSUE_FORMAT}",
-        schema=ISSUE_SCHEMA,
-        role="Reader Check",
-        stage_name="check",
-        read_only=True,
-        tier="heavy",
-    )
-    issues += collect_issues(paper_dir, [reader], "reader")
+        f"(2) every symbol or acronym in the abstract that the abstract itself does not explain, severity medium; (3) one issue for each of "
+        f"these questions the introduction leaves unanswered, severity medium: what is the question, why does it matter, how far did "
+        f"earlier work get, what is new here.\n{ISSUE_FORMAT}",
+        schema=ISSUE_SCHEMA, role="Reader Check", stage_name="check", read_only=True, tier="heavy")))
+
+    # One pool for every checker: the wall clock is ceil(jobs / max_parallel) rounds, not one round set per kind of check.
+    reports = await run_batched(jobs, lambda job: job[1]())
+    for (source, _), rep in zip(jobs, reports):
+        issues += collect_issues(paper_dir, [rep], source)
 
     issues = dedupe_issues(issues)
-    counts = {s: sum(1 for i in issues if i["severity"] == s) for s in SEVERITIES}
-    issues_path = wf / "03_issues.json"
-    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    issues_path.write_text(json.dumps({"generated": stamp, "counts": counts, "issues": issues}, indent=2, ensure_ascii=False), encoding="utf-8")
-    md = ["# Check Report", "", f"- Generated: {stamp}", f"- Issues: {len(issues)} (high {counts['high']}, medium {counts['medium']}, low {counts['low']})",
-          "- Nothing was rewritten here; `mode=revise` hands these issues to the author.", ""]
-    by_file: Dict[str, List[Dict[str, Any]]] = {}
-    for it in issues:
-        by_file.setdefault(it.get("file") or "(no file)", []).append(it)
-    for f, items in by_file.items():
-        md += [f"## {f}", ""]
-        for it in items:
-            quote = f" \u2014 \"{str(it['quote'])[:160]}\"" if it.get("quote") else ""
-            md.append(f"- **{it['severity']}** [{it.get('source', '')}] {it.get('location', '')}{quote}: {it['problem']}")
-        md.append("")
-    report = audit_dir / "01_check_report.md"
-    report.write_text("\n".join(md), encoding="utf-8")
-    log(f"Check: {len(issues)} issues (high {counts['high']}, medium {counts['medium']}, low {counts['low']}) -> {report}")
-    return {"issues": len(issues), **counts, "issues_json": str(issues_path), "report": str(report)}
+    issues_path, report, counts = _write_check_report(paths, issues, "", "Check Report", "Nothing was rewritten here; `mode=revise` hands these issues to the author.")
+    log(f"Check: {len(issues)} issues (high {counts['high']}, medium {counts['medium']}, low {counts['low']}) from {len(jobs)} checkers -> {report}")
+    return {"issues": len(issues), **counts, "checkers": len(jobs), "issues_json": str(issues_path), "report": str(report)}
 
 
 # ------------------------------------------------------------------------------
@@ -2392,13 +2558,13 @@ def _paper_rel(paper_dir: Path, raw: Any) -> Optional[str]:
         return None
 
 
-def main_part_files(paper_dir: Path) -> List[str]:
-    """main.tex's own inputs in reading order, then main.tex itself (it holds the abstract, revised last)."""
-    main = paper_dir / "main.tex"
-    if not main.exists():
+def part_files(paper_dir: Path, root_name: str) -> List[str]:
+    """`root_name`'s own inputs in reading order, then the root file itself (main.tex holds the abstract: revised last)."""
+    root = paper_dir / root_name
+    if not root.exists():
         return []
     out: List[str] = []
-    for line in read_text_safe(main).splitlines():
+    for line in read_text_safe(root).splitlines():
         code = re.split(r"(?<!\\)%", line, maxsplit=1)[0]
         for m in re.finditer(r"\\(?:input|include)\s*\{([^}]+)\}", code):
             name = m.group(1).strip()
@@ -2406,11 +2572,14 @@ def main_part_files(paper_dir: Path) -> List[str]:
             norm = _paper_rel(paper_dir, rel)
             if norm and not _is_skipped_generated_tex(Path(norm)) and (paper_dir / norm).exists() and norm not in out:
                 out.append(norm)
-    return out + ["main.tex"]
+    return out + [root_name]
 
 
-def _revise_prompt(paper_dir: Path, rel: str, items: List[Dict[str, Any]], story_path: Path, inst_path: Optional[Path], inst_len: int,
-                   genre: str = "long") -> str:
+def main_part_files(paper_dir: Path) -> List[str]:
+    return part_files(paper_dir, "main.tex")
+
+
+def _issue_lines(items: List[Dict[str, Any]]) -> List[str]:
     lines: List[str] = []
     for k, it in enumerate(items, 1):
         if "issues_to_fix" in it:  # routed from free-form instructions by the planner
@@ -2425,23 +2594,62 @@ def _revise_prompt(paper_dir: Path, rel: str, items: List[Dict[str, Any]], story
         if it.get("suggested_fix"):
             parts.append(f"suggestion: {it['suggested_fix']}")
         lines.append(" | ".join(parts))
+    return lines
+
+
+def _revise_rules(paper_dir: Path, genre: str, story_path: Path, inst_path: Optional[Path], inst_len: int) -> Tuple[str, str]:
     story = f"The paper's story is in `{story_path}`; keep it intact.\n" if story_path.exists() else ""
-    inst = (f"The full instructions are in `{inst_path}` ({inst_len} characters). Read the parts that concern this file there; text that must be "
+    inst = (f"The full instructions are in `{inst_path}` ({inst_len} characters). Read the parts that concern your files there; text that must be "
             f"inserted or replaced verbatim (acknowledgments, abstract wording, quoted sentences, equations) must be copied exactly from that file, "
             f"never reconstructed from the summary below, and do not search other folders for it.\n") if inst_path else ""
     limit = ABSTRACT_LIMITS.get(genre)
-    abstract_rule = (
-        "In the abstract and the introduction, fix an overclaim by rewording the sentence or dropping the claim, never by adding "
-        "qualifiers or hypotheses: those belong in the theorem statement or the Supplemental Material"
+    rules = (
+        "Fix each issue with the smallest edit that makes the text right, and keep the story and the flow. In the abstract and the "
+        "introduction, fix an overclaim by rewording the sentence or dropping the claim, never by adding qualifiers or hypotheses: those "
+        "belong in the theorem statement or the Supplemental Material"
         + (f", and the abstract must stay within {limit} characters including spaces. " if limit else ". ")
+        + "If an issue is mistaken, or its text is not where it says, leave the text and say why. "
+        f"Keep the macros in `{paper_dir / 'macros.tex'}`."
     )
+    return story + inst, rules
+
+
+def _revise_file_prompt(paper_dir: Path, rel: str, items: List[Dict[str, Any]], context: str, rules: str) -> str:
     return (
-        f"Revise `{paper_dir / rel}`. You own this text.\n{story}{inst}"
-        "Issues for this file (low severity = optional):\n" + "\n".join(lines) + "\n"
-        "Fix each issue with the smallest edit that makes the text right, and keep the story and the flow. " + abstract_rule +
-        "If an issue is mistaken, or its text is not in this file, leave the text and say why. "
-        f"Keep the macros in `{paper_dir / 'macros.tex'}`. Edit only this file. Reply with what you fixed and what you declined (with reasons)."
+        f"Revise `{paper_dir / rel}`. You own this text.\n{context}"
+        "Issues for this file (low severity = optional):\n" + "\n".join(_issue_lines(items)) + "\n"
+        + rules + " Edit only this file. Reply with what you fixed and what you declined (with reasons)."
     )
+
+
+def _revise_main_prompt(paper_dir: Path, order: List[str], by_file: Dict[str, List[Dict[str, Any]]], context: str, rules: str) -> str:
+    targets = [r for r in order if r in by_file]
+    reading = ", ".join(f"`{paper_dir / r}`" for r in order)
+    blocks = "\n".join(f"### {r}\n" + "\n".join(_issue_lines(by_file[r])) for r in targets)
+    return (
+        f"You are the author of the main text and revise it as one piece. First read it whole, in reading order: {reading} "
+        f"(main.tex holds the title and the abstract).\n{context}"
+        "Then fix the issues below file by file in that order, the abstract last, so that the text still reads as one story "
+        "(low severity = optional):\n" + blocks + "\n"
+        + rules + f" Edit only these files: {', '.join(targets)}. Reply with what you fixed and what you declined (with reasons)."
+    )
+
+
+async def guarded_group_edit(paper_dir: Path, snap_dir: Path, targets: Sequence[str], call: Callable[[], Any]) -> Any:
+    """Run one edit agent that may change several files; any other file it touched is restored from the checkpoint."""
+    all_files = list_editable_tex(paper_dir) + [p for p in (paper_dir / "macros.tex", paper_dir / "refs.bib") if p.exists()]
+    before = _file_hashes(all_files)
+    res = await call()
+    after = _file_hashes(all_files)
+    allowed = {str((paper_dir / r).resolve()) for r in targets}
+    for path_s, h in before.items():
+        if path_s in allowed or after.get(path_s) == h:
+            continue
+        rel = os.path.relpath(path_s, paper_dir).replace("\\", "/")
+        if (snap_dir / rel).exists():
+            restore_tex_file(paper_dir, snap_dir, rel)
+            log(f"[edit guard] restored {rel}: changed by an agent that was assigned other files")
+    return res
 
 
 async def run_revise(paths: Dict[str, Path], build_after: bool = True, prefer_referee: bool = False) -> Dict[str, Any]:
@@ -2449,6 +2657,7 @@ async def run_revise(paths: Dict[str, Path], build_after: bool = True, prefer_re
     wf = paths["wf"]
     audit_dir = paths["audit"]
     args = _wf_args()
+    genre = str(args.get("genre") or "long")
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     snap_dir = snapshot_project(paper_dir, paths["snapshots"] / f"{ts}_pre_revise")
     phase(f"Revise: the author fixes the reported issues (checkpoint {snap_dir.name})")
@@ -2477,6 +2686,7 @@ async def run_revise(paths: Dict[str, Path], build_after: bool = True, prefer_re
     by_file: Dict[str, List[Dict[str, Any]]] = {}
     inst_len = 0
     skip_plan = False
+    skipped_low: List[str] = []
     if inst_path is None:
         data = json.loads(read_text_safe(issues_path) or "{}")
         for it in data.get("issues", []) if isinstance(data, dict) else []:
@@ -2484,6 +2694,13 @@ async def run_revise(paths: Dict[str, Path], build_after: bool = True, prefer_re
             if rel:
                 by_file.setdefault(rel, []).append(it)
         source = str(issues_path)
+        if not args.get("revise_low"):
+            # A file whose issues are all low severity (copy-edit and flow hints) is not worth an agent call by default.
+            skipped_low = sorted(r for r, items in by_file.items() if all(str(i.get("severity") or "medium") == "low" for i in items))
+            for r in skipped_low:
+                by_file.pop(r)
+            if skipped_low:
+                log(f"[revise] skipped {len(skipped_low)} files with only low-severity issues (revise_low=true includes them): {skipped_low}")
     else:
         inst_text = read_text_safe(inst_path)
         if not inst_text.strip():
@@ -2540,31 +2757,41 @@ async def run_revise(paths: Dict[str, Path], build_after: bool = True, prefer_re
                 by_file.setdefault(rel, []).append({"issues_to_fix": str(it.get("issues_to_fix", "")), "instruction_refs": str(it.get("instruction_refs", ""))})
 
     story_path = wf / "01_story.md"
+    context, rules = _revise_rules(paper_dir, genre, story_path, inst_path, inst_len)
     main_order = main_part_files(paper_dir)
-    seq = [r for r in main_order if r in by_file]  # main text: one file at a time, in reading order, abstract last
-    par = [r for r in sorted(by_file) if r not in main_order]  # SM, macros, refs.bib: in parallel batches
+    main_targets = [r for r in main_order if r in by_file]
+    others = [r for r in sorted(by_file) if r not in main_order]  # SM, macros, refs.bib: technical, revised in parallel
 
     def worker(rel: str) -> Any:
-        return dispatch_agent(_revise_prompt(paper_dir, rel, by_file[rel], story_path, inst_path, inst_len, str(args.get("genre") or "long")),
+        return dispatch_agent(_revise_file_prompt(paper_dir, rel, by_file[rel], context, rules),
                               schema=REVISE_SCHEMA, role=f"Revise: {Path(rel).name}", stage_name="revise")
 
-    results = dict(zip(par, await run_guarded_edit_batches(paper_dir, snap_dir, par, worker)))
-    results.update(zip(seq, await run_guarded_edit_batches(paper_dir, snap_dir, seq, worker, batch_size=1)))
+    results: Dict[str, Any] = dict(zip(others, await run_guarded_edit_batches(paper_dir, snap_dir, others, worker)))
+    if main_targets:
+        # The main text is one story: one author reads all of it and fixes its issues in one pass, abstract last.
+        results["main text"] = await guarded_group_edit(
+            paper_dir, snap_dir, main_targets,
+            lambda: dispatch_agent(_revise_main_prompt(paper_dir, main_order, by_file, context, rules),
+                                   schema=REVISE_SCHEMA, role="Revise: main text", stage_name="revise"),
+        )
 
     # Math changes are reported, not blocked: some issues are wrong formulas that must change.
     math_changes: Dict[str, Any] = {}
-    for rel in seq + par:
+    for rel in main_targets + others:
         before, after = snap_dir / rel, paper_dir / rel
         if rel.endswith(".tex") and before.exists() and after.exists() and before.read_bytes() != after.read_bytes():
             rc, _, _, chk = run_tool("check_math_integrity.py", ["--before", str(before), "--after", str(after), "--allow-cite-changes"], allow_fail=True)
             if rc != 0 and chk:
                 math_changes[rel] = {k: chk.get(k) for k in ("mismatches_count", "quantifier_mismatches_count", "prose_lock_mismatches_count")}
 
-    lines = [f"# Revise Report ({ts})", "", f"- **Checkpoint**: `{snap_dir}`", f"- **Worked from**: `{source}`{' (planner skipped)' if skip_plan else ''}", ""]
+    lines = [f"# Revise Report ({ts})", "", f"- **Checkpoint**: `{snap_dir}`", f"- **Worked from**: `{source}`{' (planner skipped)' if skip_plan else ''}"]
+    if skipped_low:
+        lines.append(f"- **Skipped (only low-severity issues; revise_low=true includes them)**: {', '.join(skipped_low)}")
+    lines.append("")
     declined_total = 0
-    for rel in seq + par:
-        r = results.get(rel)
-        lines += [f"## {rel}", ""]
+    for key in (["main text"] if main_targets else []) + others:
+        r = results.get(key)
+        lines += [f"## {key}" + (f" ({', '.join(main_targets)})" if key == "main text" else ""), ""]
         if isinstance(r, dict):
             lines += [f"- fixed: {x}" for x in r.get("fixed") or []]
             for d in r.get("declined") or []:
@@ -2572,15 +2799,16 @@ async def run_revise(paths: Dict[str, Path], build_after: bool = True, prefer_re
                 lines.append(f"- declined: {d.get('issue', '') if isinstance(d, dict) else d} \u2014 {d.get('reason', '') if isinstance(d, dict) else ''}")
         else:
             lines.append(f"- {str(r)[:400]}")
-        if rel in math_changes:
-            lines.append(f"- math changed (review it): {math_changes[rel]}")
         lines.append("")
+    if math_changes:
+        lines += ["## Math changed (review it)", ""] + [f"- {rel}: {v}" for rel, v in math_changes.items()] + [""]
     report = audit_dir / "06_revise_report.md"
     report.write_text("\n".join(lines), encoding="utf-8")
-    out: Dict[str, Any] = {"checkpoint": str(snap_dir), "instructions": source, "planner_skipped": skip_plan, "revised_count": len(seq) + len(par),
+    out: Dict[str, Any] = {"checkpoint": str(snap_dir), "instructions": source, "planner_skipped": skip_plan,
+                           "revised_files": main_targets + others, "skipped_low": skipped_low, "agent_calls": len(others) + (1 if main_targets else 0),
                            "declined": declined_total, "math_changed_files": sorted(math_changes), "report": str(report)}
     if build_after:
-        run_tool("audit_tex_defs.py", ["--main", str(paper_dir / "main.tex"), "--json-out", str(wf / "06_revise_tex_defs.json"), "--md-out", str(audit_dir / "00_tex_defs_audit.md")], allow_fail=True)
+        out["after_revise"] = await run_check(paths, llm=False)
         out.update(await run_build(paths))
     return out
 
@@ -2810,12 +3038,14 @@ def _pause_after_story() -> bool:
 
 
 async def _check_revise_build(paths: Dict[str, Path]) -> Dict[str, Any]:
+    """One full check of the finished text, one revision by the author, then programs only (no second LLM check:
+    it mostly re-found what the author had declined with reasons). Run mode=check again by hand if wanted."""
     first = await run_check(paths)
     if not first.get("issues"):
         return {"check": first, "revise": {"skipped": True, "reason": "no issues"}, "build": await run_build(paths)}
     rv = await run_revise(paths, build_after=False)
-    again = await run_check(paths)
-    return {"check": first, "revise": rv, "recheck": again, "build": await run_build(paths)}
+    after = await run_check(paths, llm=False)
+    return {"check": first, "revise": rv, "after_revise": after, "build": await run_build(paths)}
 
 
 async def execute_mode() -> Dict[str, Any]:
@@ -2863,8 +3093,7 @@ async def execute_mode() -> Dict[str, Any]:
         out["draft"] = await run_draft(paths)
         out["figures"] = await run_figures(paths) if _wants_figures(paths) else {"skipped": True, "reason": "no figure specs, scripts, or plan figures"}
         out.update(await _check_revise_build(paths))
-        if mode == "full_auto":
-            out["blind_referee"] = await run_blind_referee(paths)
+        out["next"] = "Optional: mode=blind_referee for an isolated referee panel, then mode=revise with its report."
         return out
     raise ValueError(f"Unsupported mode: {raw}")
 
