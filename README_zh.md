@@ -1,6 +1,6 @@
 # Liber —— 理论物理论文写作 skill `/write-paper`
 
-*[English](README.md) | [中文说明](README_zh.md)*
+*[English](README.md) | [中文说明](README_zh.md) | [它能做什么（使用说明）](GUIDE_zh.md)*
 
 **Liber**（拉丁文，原指树皮内层，古人在上面写字，后来引申为“书”）提供一个 skill：**`/write-paper`**。
 
