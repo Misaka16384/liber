@@ -154,7 +154,7 @@ def _write_opencode_command(cmd_path: Path, skill_dir: Path) -> None:
     cmd_path.parent.mkdir(parents=True, exist_ok=True)
     content = (
         f"---\n"
-        f"description: Modular theoretical physics LaTeX paper workflow, story first then checks (/write-paper v3)\n"
+        f"description: Modular theoretical physics LaTeX paper workflow, the author decides the story, AI writes and checks (/write-paper v4)\n"
         f"---\n\n"
         f"Load and follow `{skill_dir / 'SKILL.md'}` with `<SKILL_DIR> = {skill_dir.as_posix()}`.\n"
         f"Run `python {(skill_dir / 'scripts' / 'run_paper.py').as_posix()} --help` or call `scripts/tools/*.py`.\n\n"

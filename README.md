@@ -20,7 +20,7 @@ Then start a new agent session and type `/write-paper`. Needs Python 3.8+; a TeX
 
 `/write-paper` works across **Claude Code**, **OpenAI Codex CLI**, **Google Antigravity (IDE & `agy` CLI)**, **OpenCode**, **Qwen**, **`npx skills add`**, and **standalone Python CLI**.
 
-**v3: write first, check afterwards.** A writer facing a long list of hard rules writes a checklist, not a paper. So `/write-paper` gives the writer material (the exact results, the story, a verified history of the question, the notation) and three bottom lines, and checks everything else after the text exists: length limits, acronyms in the abstract, scope and quantifiers, attribution, numbers. Checkers only report; the author fixes, with the smallest edit that keeps the story. Around that core: *PRL* / *Nature* figure gates (PyMuPDF + AST), DOI + arXiv + `.bbl` citation auditing, deterministic clean-up and build, optional cross-vendor checking and context-isolated blind refereeing.
+**v4: you decide the story, AI writes and checks.** Narrative and structure are the author's call; drafting, checking, citations and the build are repetitive work for agents. Before you decide, agents give you information, not advice: the results with their evidence, a citation-verified literature map, the open questions. You say what you think first, then the agent gives its view, and you settle it together. Your decisions are recorded with what they rest on and are not treated as rules: when an agent later finds that one does not hold (weaker evidence, a reference that changes what is new, a part that cannot be written as planned), it brings it back to you as a **concern** instead of obeying or overriding silently. The workflow starts from wherever your paper stands (notes only, half written, finished) and runs only what is missing; `--effort low|medium|high` sets how much checking it does. Around that core: *PRL* / *Nature* figure gates (PyMuPDF + AST), DOI + arXiv + `.bbl` citation auditing plus a coarse-to-fine check that each citation fits its sentence (abstracts first, full text for key citations, verdicts and reading notes kept for reuse), deterministic clean-up and build, optional cross-vendor checking and context-isolated blind refereeing.
 
 ---
 
@@ -28,17 +28,20 @@ Then start a new agent session and type `/write-paper`. Needs Python 3.8+; a TeX
 
 ```mermaid
 flowchart LR
-  S0["inventory: material pack (ledger, red lines, story material)"] --> S1["story: verified lineage, one-page story, block plan"]
-  S1 --> P{{"you read 01_story.md"}}
-  P --> S2["draft: one author, block by block (SM in parallel)"]
-  S2 --> F["figures (PRL/Nature theme + PyMuPDF/AST gate)"]
-  F --> C["check: report only (scope, numbers, citations, abstract read alone)"]
-  C --> R["revise: one author fixes the main text in one pass"]
-  R --> C2["programs re-check"] --> B["build (clean-up, dual compile, arXiv flatten)"]
-  B -.-> Ref["blind_referee, when you ask (isolated, optionally cross-vendor)"] -.-> R
+  SV["survey: where the paper stands"] --> S0["inventory: material pack"]
+  S0 --> BR["brief: results, verified literature map, open questions"]
+  BR --> D{{"you speak first, then the agent; agree the story"}}
+  D --> ST["story, plan, decision record"] --> K{{"you confirm"}}
+  K --> S2["draft: only missing or partial blocks"]
+  S2 --> F["figures"] --> C["check: report only (scope, numbers, citation fit, abstract)"]
+  C --> R["revise"] --> B["programs re-check, build"]
+  C -. "concerns that touch the story" .-> Q{{"you answer"}}
+  S2 -.-> Q
+  R -.-> Q
+  Q -. "only the affected blocks are rewritten" .-> S2
 ```
 
-The whole story is written first and checked once, all checkers in one parallel pool. A second LLM check and the referee panel run only when you ask.
+A finished paper skips the story part and goes straight to check; a half-written one gets a briefing that also says what story the draft tells now, and only its missing blocks are written. Your hand edits between runs are kept and passed to the agents as intended.
 
 ---
 
@@ -90,17 +93,21 @@ npx skills add /path/to/liber -y
 
 ### Option A: Use Slash Command / Skill Inside Any Agent
 Open Claude Code, Codex, Antigravity, or OpenCode inside your manuscript folder and ask:
-- *"Use `/write-paper` (`inventory` + `story`) on `./notes` and `./SCOPE.md` for a PRL Letter, and show me the story before drafting."*
-- *"Run `/write-paper` `check` on my draft `./paper` and give me the issue list."*
+- *"Use `/write-paper` on `./notes` for a PRL Letter."* (the agent runs `auto`, then walks you through the briefing: core information first, your idea, then its view)
+- *"Where does `./paper` stand? Then check it at low effort."*
 - *"Run `/write-paper` `figures` on `./paper` in `nature` style."*
 
 ### Option B: Run the Cross-Agent Python Orchestrator Directly
 `run_paper.py` drives `claude`, `agy` or `codex` workers; the check stage and the referee panel can run on another vendor:
 
 ```bash
-# 1. Material pack, verified lineage, one-page story and block plan; stops for you to read .workflow/01_story.md
+# where does the paper stand? (programs only)
+python skills/write-paper/scripts/run_paper.py --mode survey --paper-dir ./paper
+
+# run what it still needs; it stops at the briefing, the story confirmation and blocking concerns.
+# After each stop: discuss / confirm / answer, then run the same line again.
 python skills/write-paper/scripts/run_paper.py \
-  --mode full_auto \
+  --mode auto \
   --paper-dir ./paper \
   --source-paths ./notes \
   --authority-paths ./SCOPE_AND_TRUTH.md \
@@ -108,24 +115,26 @@ python skills/write-paper/scripts/run_paper.py \
   --genre letter \
   --figure-style prl
 
-# 2. After reading (and editing) the story: draft, figures, check, revise, deterministic re-check, build.
-#    Gemini (agy) writes, Claude checks.
-python skills/write-paper/scripts/run_paper.py \
-  --mode draft_and_check \
-  --paper-dir ./paper \
-  --source-paths ./notes \
-  --authority-paths ./SCOPE_AND_TRUTH.md \
-  --genre letter \
-  --backend agy \
-  --check-backend claude
+# a finished draft: a quick pass, Gemini (agy) revises, Claude checks
+python skills/write-paper/scripts/run_paper.py --mode auto --from check --effort low \
+  --paper-dir ./paper --source-paths ./notes --backend agy --check-backend claude
 
-# 3. Optional: isolated blind referees on a different vendor, then hand the report to the author
+# optional: isolated blind referees on another vendor, then hand the report to the author
 python skills/write-paper/scripts/run_paper.py --mode blind_referee --paper-dir ./paper --backend agy --referee-backend claude
 python skills/write-paper/scripts/run_paper.py --mode revise --paper-dir ./paper \
   --repair-instructions ./paper/audit_reports/05_blind_referee_report.md
 ```
 
-`--no-pause` runs `full_auto` straight through. For one paper, step 1 runs once (unchanged notes are not rescanned); step 2 can be repeated. `--max-parallel 6` (up to 8) speeds up every parallel phase if your API quota allows. Old mode names still work (`blueprint`, `verify`, `citations`, `hygiene`, `repair`, `draft_and_audit`, `audit_polish`).
+| Option | Meaning |
+| :--- | :--- |
+| `--effort low` / `medium` / `high` | low: lineage only, no scripted numeric checks, no citation-fit check, 6 agents in parallel; medium (default): lineage + neighbouring work, 4 numeric checks, citation fit from abstracts with up to 8 works read in full; high: wider map, 10 numeric checks, up to 20 works read in full, low-severity fixes, a blind referee at the end |
+| `--from brief` / `story` / `draft` / `check` / `revise` / `build` | start there and run to the end (`brief` reopens the story) |
+| `--only <files>` | limit draft, check and revise to these files |
+| `--no-pause` | unattended: the agent picks the story itself, concerns wait in `07_feedback.json` |
+| `--reference-pdfs <dir>` | PDFs named `<bibkey>.pdf`, read when a key citation needs its full text (otherwise arXiv) |
+| `--citation-notes-dir <dir>` | where citation verdicts and reading notes are kept; share it across papers |
+
+Old mode names still work (`full_auto`=`auto`, `draft_and_check`, `check_and_revise`, `blueprint`, `verify`, `citations`, `hygiene`, `repair`, `draft_and_audit`, `audit_polish`).
 
 ### Option C: Run Antigravity Native `run_workflow`
 Pass `scripts/paper_workflow.py` as `ScriptPath` with `Args` matching `scripts/workflow.json`.
@@ -143,19 +152,23 @@ Every stage can be run on its own, also on an existing draft:
 
 | Mode | What it does |
 | :--- | :--- |
-| `inventory` | Material pack: `00_ground_truth_ledger.json` (every result with its exact statement, hypotheses, source and tier; merged by the program from the scans, so nothing is paraphrased), `00_redlines.md` (your prohibitions: the only rule list writers see), `00_story_material.md` (motivation, pictures, surprises, history in your notes); voice samples from good papers. Unchanged notes reuse their cached scans. |
-| `story` | Traces 4-8 historical steps and verifies each reference itself; writes **`01_story.md`** (one page: the question, its history, why it is open, the answer in words, why it matters, what goes where) and `01_plan.json` (blocks that name results by ledger id only), plus `macros.tex`. `full_auto` pauses here. |
-| `draft` | One author writes the main text block by block in reading order, then reads it all through and writes title and abstract for what is there; the Supplemental Material is written in parallel, rigour first. Each block gets the exact ledger records, never a paraphrase. |
-| `figures` | Builds figures with `journal_fig_theme.py` (`prl` / `nature`) + `verify_figures.py` PyMuPDF & AST gates. |
-| `check` | One pass over the finished text, report only, all checkers in one parallel pool: the whole main text read by one checker and the Supplemental Material in groups of about 60 KB, against the ledger and your original files (scope, quantifiers, attribution, numbers, math); scripted SymPy/numeric checks of up to 4 core results (`--max-numeric-checks`); a reader check of abstract and introduction; plus the deterministic audits (abstract read alone: acronyms and the 600-character PRL limit; definitions; citations). Writes `03_issues.json` and `audit_reports/01_check_report.md`. |
-| `revise` | The author fixes the issues (or a referee report / your notes): Supplemental Material files in parallel, then one author reads the whole main text and fixes it in one pass, abstract last; smallest edit, keeps the story; may decline a mistaken issue with a reason; files with only low-severity issues are skipped (`--revise-low` includes them); math changes are listed for you. Afterwards only the programs re-check. |
+| `survey` | Programs only: each block empty / partial / full, the plan (or one derived from your `.tex` files), hand edits since the last run, open concerns, what `auto` would do next. |
+| `inventory` | Material pack: `00_ground_truth_ledger.json` (every result with its exact statement, hypotheses, source and tier; merged by the program, so nothing is paraphrased), `00_redlines.md`, `00_story_material.md`; voice samples from good papers. With no notes, it is built from the paper itself. Unchanged files reuse their cached scans. |
+| `brief` | Lineage and neighbouring-work agents; every reference verified by the program; what the map says each work did checked coarse to fine; then **`01_briefing.md`**: results with evidence and scope, the literature, limits and red lines, open questions. Information only: no storyline, no ranking, no advice. |
+| `story` | From your discussion (`01_discussion.md`): `01_story.md`, `01_plan.json`, **`01_decisions.json`** (each decision with what it rests on), `macros.tex`. Existing files are kept; existing blocks that must change are marked. |
+| `draft` | One author writes the missing, partial or marked main-text blocks in reading order (reading the complete ones for continuity), then reads it all through and writes or updates title and abstract; SM blocks in parallel. Writers may raise concerns. |
+| `figures` | Builds figures with `journal_fig_theme.py` (`prl` / `nature`) + `verify_figures.py` PyMuPDF & AST gates; `auto` makes only missing ones. |
+| `check` | Report only, all checkers in one parallel pool: the main text read whole and the SM in groups (scope, quantifiers, attribution, numbers, math), scripted numeric checks, a reader check of abstract and introduction, the deterministic audits, and the **citation-fit check**: each citing sentence with the cited works' abstracts and notes, judged coarse to fine (misattribution, a review cited for a priority claim, later work cited as prior, a novelty claim a cited work contradicts), with location and quote when read in full. Findings that would change the story become concerns. Writes `03_issues.json`, `audit_reports/01_check_report.md`, `audit_reports/08_citation_check.md`. |
+| `revise` | The author fixes the issues (or a referee report / your notes): SM files in parallel, then the main text in one pass, abstract last; an issue that goes against one of your decisions is declined and becomes a concern. Afterwards only the programs re-check. |
 | `cleanup` | Deterministic clean-up only (invisible characters, typography); no LLM rewriting. |
 | `build` | Clean-up, dual `main.tex` + `supplement.tex` compile, layout and leak checks, `\status{...}`-free `main_arxiv.tex`. |
-| `blind_referee` | Specialist, broad reader (who first answers: what, why, how far earlier work got, what is new) and editor, inside a throw-away copy holding only the manuscript, `.bib`/`.bbl`, figure PNGs and audit JSONs. |
+| `blind_referee` | Specialist, broad reader and editor, inside a throw-away copy holding only the manuscript, `.bib`/`.bbl`, figure PNGs and audit JSONs. |
 
 ---
 
-## Safety Guarantees (v3)
+## Safety Guarantees (v4)
+
+- **Your decisions stay yours.** Agents never decide the story: a finding that touches it is filed as a concern with evidence and options; a blocking one stops the run at a stage boundary, and your answer is versioned in the decision record. Your hand edits are detected and never reverted.
 
 - **Gates fail closed.** A citation that could not be checked (offline, rate-limited, no match) fails the citation gate unless `verify_citations.py audit --allow-offline` is given; empty or mistyped inputs fail every tool. Exit codes everywhere: `0` pass, `1` issues found (see the JSON), `2` usage/tool error.
 - **No silent rewrites.** `--fix` / `--fix-braces` / `--upgrade-preprints` edit in place only what they change, keep the file's encoding and line endings, leave `@string`/`@comment`/comments/macros untouched, and store the previous version in `.wp_backups/` next to the file.
@@ -179,7 +192,8 @@ All verification scripts run completely standalone with zero LLM dependency:
 3. **`check_math_integrity.py`** — State-machine lock preserving 100% of math tokens (`$...$`, `\[...\]`, equations), `\label`/`\ref`-family/`\cite`-family/`\extref`/`\status{...}`, macro definitions, ordered quantifiers in abstracts and claim environments (incl. starred and `\newtheorem` ones; on by default), and the counts of negation/strength words (`not`, `necessary`, `sufficient`, `at least`, `exponentially`, ...) and numbers anywhere in the prose.
 4. **`verify_citations.py`** — Queries Crossref, INSPIRE-HEP, and HTTPS arXiv Atom APIs; cross-checks DOI and `eprint` bidirectionally (`EPRINT_DOI_MISMATCH`); verifies multi-author ordering (`AUTHOR_ORDER_MISMATCH`); handles `@book` chapter DOIs; and audits compiled `*.bbl` files for duplicate `arXiv:` strings and downcased math/proper nouns.
 5. **`clean_watermarks.py`** & **`style_metrics.py`** — Strips invisible Unicode characters and fixes typography; reports copy-edit slips, stock phrases and runs of very short sentences (reports go to the author through `check`; nothing is rewritten by an LLM).
-6. **`build_and_flatten_tex.py`** — Cross-platform TeX Live / MiKTeX compiler (`pdflatex -> bibtex -> pdflatex -> pdflatex`), PyMuPDF layout collision checker, APS word-equivalent counter, and clean single-file arXiv flattener stripping `\status{...}` and internal paths.
+6. **`fetch_fulltext.py`** — Turns a cited work (arXiv id or a local PDF) into plain text with page markers for the fine pass of the citation check; the PDF itself is never shown to a model.
+7. **`build_and_flatten_tex.py`** — Cross-platform TeX Live / MiKTeX compiler (`pdflatex -> bibtex -> pdflatex -> pdflatex`), PyMuPDF layout collision checker, APS word-equivalent counter, and clean single-file arXiv flattener stripping `\status{...}` and internal paths.
 
 ---
 

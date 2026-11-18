@@ -1130,6 +1130,315 @@ def test_build_fixer_never_makes_figures():
     assert res["missing_files"] == ["figures/fig_gap"] and res["clean"] is False
 
 
+# ------------------------------------------------------------------------------------- v4: effort, survey, concerns, auto
+
+FULL_TEXT = ("The question is old. " * 30).strip()
+
+
+def _paper_with_blocks(name):
+    """A paper at mixed completion: s1 complete, s2 partial (\\todo), s3 missing; a real abstract."""
+    p = tmpdir(name)
+    (p / "sections").mkdir()
+    (p / "sections" / "s1.tex").write_text("\\section{Question}\n" + FULL_TEXT + "\n", encoding="utf-8")
+    (p / "sections" / "s2.tex").write_text("\\section{Answer}\n" + FULL_TEXT + " \\todo{the gap formula}\n", encoding="utf-8")
+    (p / "main.tex").write_text(
+        "\\documentclass{revtex4-2}\n\\providecommand{\\todo}[1]{\\textbf{[TODO: #1]}}\n\\begin{document}\n\\title{Chains}\n"
+        "\\begin{abstract}" + " ".join(["We ask how a gap closes in a chain of spins and answer it."] * 2) + "\\end{abstract}\n"
+        "\\input{sections/s1}\n\\input{sections/s2}\n\\input{sections/s3}\n\\end{document}\n", encoding="utf-8")
+    return p
+
+
+def test_effort_presets_and_explicit_overrides():
+    p = tmpdir("effort")
+    we = _engine(p)
+    assert we.initial_batch_size({"effort": "low"}) == 6 and we.initial_batch_size({}) == 4
+    assert we.initial_batch_size({"effort": "low", "max_parallel": 2}) == 2, "an explicit max_parallel wins"
+    we._STATE["wf_args"] = {"paper_dir": str(p), "effort": "low"}
+    assert we.effort_setting("max_numeric_checks") == 0 and we.effort()["cite_context_batch"] == 0
+    we._STATE["wf_args"] = {"paper_dir": str(p), "effort": "low", "max_numeric_checks": 3}
+    assert we.effort_setting("max_numeric_checks") == 3
+    we._STATE["wf_args"] = {"paper_dir": str(p), "effort": "high"}
+    assert we.effort_setting("revise_low") is True and we.effort()["referee"] and we.effort_setting("max_numeric_checks") == 10
+    we._STATE["wf_args"] = {"paper_dir": str(p), "effort": "nonsense"}
+    assert we.effort_level() == "medium"
+
+
+def test_survey_reads_any_completion_and_derives_a_plan():
+    p = _paper_with_blocks("survey")
+    we = _engine(p)
+    paths = we.ensure_dirs(p)
+    assert [we.block_status(p, f) for f in ("sections/s1.tex", "sections/s2.tex", "sections/s3.tex")] == ["full", "partial", "empty"]
+    assert not we.abstract_missing(p)
+    plan = we.derive_plan_from_tex(p)
+    assert [b["file"] for b in plan["blocks"]] == ["sections/s1.tex", "sections/s2.tex"], "inputs that exist, in reading order"
+    assert plan["blocks"][0]["purpose"] == "existing text: Question" and plan["title"] == "Chains"
+    st = we.run_survey(paths)
+    assert st["plan"] == "derived from the .tex files" and "briefing" in st["next"], st["next"]
+    assert (p / "audit_reports" / "00_survey.md").exists()
+    # a single-file paper is one block
+    q = tmpdir("survey1")
+    (q / "main.tex").write_text("\\begin{document}" + FULL_TEXT + "\\end{document}", encoding="utf-8")
+    assert [b["file"] for b in we.derive_plan_from_tex(q)["blocks"]] == ["main.tex"]
+    skeleton = tmpdir("survey2")
+    we.write_skeleton(skeleton / "main.tex", ["sections/a.tex"], "letter", "T", supplement=False)
+    assert we.block_status(skeleton, "main.tex") == "empty" and we.abstract_missing(skeleton), "the skeleton's [TODO] macro is not text"
+
+
+def test_draft_fills_only_missing_partial_and_rewrite_blocks():
+    p = _paper_with_blocks("fill")
+    wf = p / ".workflow"
+    wf.mkdir()
+    plan = {"title": "Chains", "blocks": [
+        {"id": "s1", "part": "main", "file": "sections/s1.tex", "purpose": "the question"},
+        {"id": "s2", "part": "main", "file": "sections/s2.tex", "purpose": "the answer"},
+        {"id": "s3", "part": "main", "file": "sections/s3.tex", "purpose": "why it matters"},
+    ], "figures": []}
+    (wf / "01_plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    (wf / "01_decisions.json").write_text(json.dumps({"decisions": [{"id": "D1", "choice": "headline = the gap", "basis": "THM-1"}]}), encoding="utf-8")
+    concern = {"kind": "evidence", "blocking": True, "finding": "the gap formula is only numerical", "evidence": "notes.md:4", "decision_id": "D1"}
+    fake = FakeAgy(answers={"Author": lambda pr: {"file": "x", "concerns": [concern]} if "`s3`" in pr else {"file": "x"}})
+    we = _antigravity_engine(p, fake, genre="letter")
+    try:
+        res = asyncio.run(we.run_draft(we.ensure_dirs(p)))
+        author = [c["prompt"] for c in fake.calls if c["role"] == "Author"]
+        assert len(author) == 3 and res["kept"] == ["s1"], [c["role"] for c in fake.calls]
+        assert "Block 1/2 `s2`: complete" in author[0] and "sections/s1.tex" in author[0].replace("\\", "/")
+        assert "Block 2/2 `s3`: write" in author[1]
+        assert "check the title and the abstract" in author[2], "an existing abstract is updated only where needed"
+        fb = json.loads((wf / "07_feedback.json").read_text(encoding="utf-8"))["items"]
+        assert len(fb) == 1 and fb[0]["blocking"] and fb[0]["decision_choice"] == "headline = the gap" and res["concerns"] == 1
+
+        fake.calls.clear()
+        we.mark_rewrite(wf, [{"block": "s1", "why": "the author changed the headline"}])
+        res = asyncio.run(we.run_draft(we.ensure_dirs(p)))
+        author = [c["prompt"] for c in fake.calls if c["role"] == "Author"]
+        assert "rewrite" in author[0] and "the author changed the headline" in author[0] and "`s1`" in author[0]
+        assert json.loads((wf / "01_rewrite.json").read_text(encoding="utf-8")) == {}, "done rewrites are cleared"
+        assert len(json.loads((wf / "07_feedback.json").read_text(encoding="utf-8"))["items"]) == 1, "a repeated concern is not filed twice"
+    finally:
+        we._STATE["runtime"] = "cli"
+
+
+def test_concerns_go_to_the_author_and_answers_are_applied():
+    p, plan = _v3_workspace("concern")
+    (p / "sections").mkdir()
+    for f in ("s1", "s2", "sm1"):
+        (p / "sections" / f"{f}.tex").write_text(f"text of {f}\n", encoding="utf-8")
+    (p / "main.tex").write_text("\\begin{document}\\begin{abstract}A.\\end{abstract}\\input{sections/s1}\\input{sections/s2}\\end{document}\n", encoding="utf-8")
+    checker = {"issues": [
+        {"file": "sections/s2.tex", "problem": "the headline theorem is proven only for odd n", "severity": "high", "feedback_kind": "evidence", "decision_id": "D1"},
+        {"file": "sections/s1.tex", "problem": "the introduction also states it for all n", "severity": "medium", "feedback_kind": "evidence", "decision_id": "D1"},
+        {"file": "sections/s2.tex", "problem": "a sign slip", "severity": "medium"}]}
+
+    def apply(prompt):
+        assert "keep the old headline" not in prompt and "state it for odd n" in prompt
+        return {"rewrite": [{"block": "result", "why": "headline now for odd n"}, {"block": "nonexistent", "why": "x"}]}
+
+    fake = FakeAgy(answers={"Check main text": checker, "Check": {"issues": []}, "Numeric": {"issues": []}, "Reader": {"issues": []},
+                            "Apply Answers": apply})
+    we = _antigravity_engine(p, fake, genre="letter")
+    orig_tool = we.run_tool
+    we.run_tool = lambda name, cli, allow_fail=True, timeout_s=1800: (0, "", "", {"entries": [], "todo_placeholders": []} if name == "verify_citations.py" else {})
+    try:
+        paths = we.ensure_dirs(p)
+        res = asyncio.run(we.run_check(paths))
+        issues = json.loads((p / ".workflow" / "03_issues.json").read_text(encoding="utf-8"))["issues"]
+        assert [i["problem"] for i in issues] == ["a sign slip"] and res["concerns"] == 1, "the story-level issue goes to the author, not to revise"
+        fb_items = we.load_feedback(p / ".workflow")["items"]
+        assert len(fb_items) == 1 and "Also: the introduction also states it for all n" in fb_items[0]["evidence"], \
+            "two findings about the same decision are one question for the author"
+        paused = we._gate(paths, {})
+        assert paused and paused["paused"] == "concerns" and "headline theorem" in paused["next"]
+        data = we.load_feedback(p / ".workflow")
+        data["items"].append({**data["items"][0], "id": "F2", "finding": "another", "status": "answered", "answer": "keep the old headline", "keep": True})
+        data["items"][0].update(status="answered", answer="state it for odd n")
+        we.save_feedback(paths, data)
+        out = asyncio.run(we.apply_feedback(paths))
+        assert out == {"applied": 2, "changed": 1, "rewrite": ["result"]}, out
+        assert json.loads((p / ".workflow" / "01_rewrite.json").read_text(encoding="utf-8")) == {"result": "headline now for odd n"}
+        assert [c["role"] for c in fake.calls].count("Apply Answers") == 1 and we._gate(paths, {}) is None
+    finally:
+        we.run_tool = orig_tool
+        we._STATE["runtime"] = "cli"
+
+
+def test_hand_edits_are_detected_and_never_called_ai_text():
+    p = _paper_with_blocks("hand")
+    we = _engine(p)
+    paths = we.ensure_dirs(p)
+    assert we.detect_hand_edits(paths) == [], "first run: there is nothing to compare with"
+    we.remember_text(paths)
+    (p / "sections" / "s1.tex").write_text("\\section{Question}\nMy own sentence.\n" + FULL_TEXT + "\n", encoding="utf-8")
+    assert we.detect_hand_edits(paths) == ["sections/s1.tex"]
+    note = we.hand_edit_note(p / ".workflow")
+    assert "sections/s1.tex" in note and "never undo" in note
+    assert "+My own sentence." in (p / ".workflow" / "05_hand_edits.diff").read_text(encoding="utf-8")
+    we.remember_text(paths, we.text_hashes(p))  # a run that changed nothing (survey, a stop at the briefing)
+    assert we.detect_hand_edits(paths) == ["sections/s1.tex"], "a run that did not touch the file does not absorb the hand edit"
+    before = we.text_hashes(p)
+    (p / "sections" / "s1.tex").write_text("\\section{Question}\nRevised by an agent.\n" + FULL_TEXT + "\n", encoding="utf-8")
+    we.remember_text(paths, before)  # a run whose agent edited s1.tex (after reading the hand edit)
+    assert we.detect_hand_edits(paths) == [], "once an agent has worked on the file, its text is the workflow's again"
+
+
+def test_auto_stops_for_the_author_then_writes():
+    p = tmpdir("auto")
+    notes = p / "notes"
+    notes.mkdir()
+    (notes / "a.md").write_text("gap 2|J-h|\n", encoding="utf-8")
+    paper = p / "paper"
+    paper.mkdir()
+    wf = paper / ".workflow"
+
+    def judge(prompt):
+        for n in ("00_redlines.md", "00_story_material.md"):
+            (wf / n).write_text("x\n", encoding="utf-8")
+        return {"core": ["a-1"], "duplicates": [], "cited_seed_hints": []}
+
+    def brief(prompt):
+        assert "do not propose a storyline" in prompt and "Open questions for the author" in prompt
+        (wf / "01_briefing.md").write_text("# Briefing\n", encoding="utf-8")
+        return {"open_questions": 2}
+
+    def story(prompt):
+        assert ("agreed points are in" in prompt) == (wf / "01_discussion.md").exists()
+        (wf / "01_story.md").write_text("story\n", encoding="utf-8")
+        (wf / "01_plan.json").write_text(json.dumps({"title": "T", "blocks": [
+            {"id": "q", "part": "main", "file": "sections/q.tex", "purpose": "the question", "claim_ids": ["a-1"]}], "figures": []}), encoding="utf-8")
+        (wf / "01_decisions.json").write_text(json.dumps({"decisions": [{"id": "D1", "choice": "c", "source": "author"}]}), encoding="utf-8")
+        return {"rewrite": []}
+
+    fake = FakeAgy(answers={"Scan": {"records": [{"file": "a.md", "claims": [{"statement": "gap 2|J-h|"}]}]}, "Judge Material Pack": judge,
+                            "Lineage": {"steps": []}, "Neighbouring Work": {"clusters": [], "concurrent": []}, "Briefing": brief,
+                            "Story and Plan": story})
+    we = _antigravity_engine(paper, fake, source_paths=[str(notes)])
+    calls = []
+
+    async def fake_stage(name, ret):
+        calls.append(name)
+        return ret
+
+    orig = {n: getattr(we, n) for n in ("run_draft", "run_check", "run_revise", "run_build")}
+    we.run_draft = lambda paths: fake_stage("draft", {"main_blocks": 1})
+    we.run_check = lambda paths, llm=True: fake_stage("check" if llm else "recheck", {"issues": 0})
+    we.run_build = lambda paths: fake_stage("build", {"clean": True})
+    try:
+        paths = we.ensure_dirs(paper)
+        r1 = asyncio.run(we.run_auto(paths))
+        assert r1["paused"] == "discuss" and "let them speak first" in r1["next"] and (wf / "01_briefing.md").exists()
+        assert "Story and Plan" not in [c["role"] for c in fake.calls], "no story before the author has spoken"
+        n = len(fake.calls)
+        r2 = asyncio.run(we.run_auto(paths))
+        assert r2["paused"] == "discuss" and len(fake.calls) == n, "without a discussion nothing new runs"
+        (wf / "01_discussion.md").write_text("headline: the gap\n", encoding="utf-8")
+        r3 = asyncio.run(we.run_auto(paths))
+        assert r3["paused"] == "confirm" and (wf / "01_story.md").exists() and not calls
+        r4 = asyncio.run(we.run_auto(paths))
+        assert r4.get("lock", {}).get("locked") and calls == ["draft", "check", "build"] and r4["next"].startswith("Done")
+        assert (wf / "01_lock.json").exists() and (wf / "06_checked_hashes.json").exists()
+
+        # a paper with nothing missing and no lock (e.g. entered at check), one block marked by an answer
+        calls.clear()
+        fake.calls.clear()
+        (paper / "sections").mkdir(exist_ok=True)
+        (paper / "sections" / "q.tex").write_text(FULL_TEXT + "\n", encoding="utf-8")
+        (paper / "main.tex").write_text("\\begin{document}\\begin{abstract}" + FULL_TEXT + "\\end{abstract}\\input{sections/q}\\end{document}\n", encoding="utf-8")
+        (wf / "01_lock.json").unlink()
+        we.mark_rewrite(wf, [{"block": "q", "why": "an answer changed the headline"}])
+        r6 = asyncio.run(we.run_auto(paths))
+        assert "brief" not in r6 and "paused" not in r6 and calls == ["draft", "check", "build"], "a rewrite mark alone does not reopen the story"
+
+        calls.clear()
+        we._STATE["wf_args"]["pause_after_story"] = False
+        we._STATE["wf_args"]["start"] = "brief"
+        fake.calls.clear()
+        r5 = asyncio.run(we.run_auto(paths))
+        roles = [c["role"] for c in fake.calls]
+        assert "Briefing" in roles and "Story and Plan" in roles and "paused" not in r5, "unattended: brief, story and lock in one run"
+    finally:
+        for n, f in orig.items():
+            setattr(we, n, f)
+        we._STATE["runtime"] = "cli"
+
+
+def test_citation_contexts_join_sentences_with_abstracts():
+    p = tmpdir("citectx")
+    we = _engine(p)
+    (p / "s.tex").write_text("Earlier work. The gap closes, as shown in Ref.~\\cite{Smith2001,Lee99}. Next.\n\n% \\cite{Hidden}\n"
+                             "Another \\citep[see][]{Lee99} claim \\cite{TODO:find}.\n", encoding="utf-8")
+    audit = {"entries": [{"key": "Smith2001", "api_meta": {"title": "Gap", "year": "2001", "authors": ["A. Smith"], "abstract": "We show the gap closes."}}]}
+    litmap = "1. **2001 Smith** [verified: Smith2001]\n   - Question: does the gap close?\n   - Found: it does\n2. next\n"
+    ctx = we.citation_contexts(p, audit, litmap, ["s.tex"])
+    assert [c["line"] for c in ctx] == [1, 4] and ctx[0]["sentence"].startswith("The gap closes"), "commented and TODO cites are skipped"
+    smith, lee = ctx[0]["works"]
+    assert smith["abstract"] == "We show the gap closes." and "Found: it does" in smith["literature_map"]
+    assert lee["abstract"] == "(no abstract available)"
+
+
+def test_citation_check_goes_coarse_to_fine_and_keeps_its_notes():
+    p = tmpdir("c2f")
+    paths = None
+    ctx = [{"file": "s.tex", "line": 3, "sentence": "The gap was first proven by Smith~\\cite{Smith2001,Lee99}.",
+            "works": [{"key": "Smith2001", "title": "Gap", "year": "2001", "abstract": "Numerics suggest a gap.", "arxiv": "0101.0001"},
+                      {"key": "Lee99", "title": "Chains", "year": "1999", "abstract": "A review of chains."}]}]
+
+    def coarse(prompt):
+        items = json.loads(Path(prompt.split("`")[1]).read_text(encoding="utf-8"))
+        return {"verdicts": [{"id": i["id"], "verdict": "unclear" if i["work"]["key"] == "Smith2001" else "supported",
+                              "importance": "key" if i["work"]["key"] == "Smith2001" else "background"} for i in items]}
+
+    def fine(prompt):
+        assert "=== page N ===" in prompt and "at most 25 words" in prompt
+        pid = json.JSONDecoder().raw_decode(prompt.split("Sentences:\n", 1)[1])[0][0]["id"]
+        return {"verdicts": [{"id": pid, "verdict": "not_supported", "problem": "only numerical evidence, no proof", "location": "Sec. III, p. 4",
+                              "evidence": "we find numerically", "novelty": False}],
+                "facts": [{"statement": "numerical evidence for a gap at h<1", "location": "Fig. 2, p. 4", "quote": "we find numerically"}]}
+
+    fake = FakeAgy(answers={"Citation Check": coarse, "Citation Full Text": fine})
+    we = _antigravity_engine(p, fake)
+    fetched = []
+
+    def fake_fetch(nd, work):
+        fetched.append(work["key"])
+        txt = nd / f"{work['key']}.txt"
+        txt.write_text("=== page 1 ===\nwe find numerically\n" * 50, encoding="utf-8")
+        return txt
+
+    orig = we.fetch_full_text
+    we.fetch_full_text = fake_fetch
+    try:
+        paths = we.ensure_dirs(p)
+        jobs, state = we.coarse_citation_jobs(paths, ctx)
+        out = asyncio.run(we.finish_citation_check(paths, state, asyncio.run(we.run_batched(jobs, lambda j: j[1]()))))
+        roles = [c["role"] for c in fake.calls]
+        assert roles == ["Citation Check 1", "Citation Full Text Smith2001"] and fetched == ["Smith2001"], "only the doubtful key citation is read in full"
+        v = {x["key"]: x for x in out["verdicts"]}
+        assert v["Smith2001"]["verdict"] == "not_supported" and v["Smith2001"]["level"] == "fulltext" and v["Lee99"]["level"] == "abstract"
+        issues = we.issues_from_citation_verdicts(out["verdicts"])
+        assert len(issues) == 1 and issues[0]["severity"] == "high" and "Sec. III" in issues[0]["evidence"]
+        nd = p / ".workflow" / "citation_notes"
+        note = json.loads((nd / "Smith2001.json").read_text(encoding="utf-8"))
+        assert note["facts"][0]["location"] == "Fig. 2, p. 4", "what was read in full is kept for later citations"
+        assert "Sec. III, p. 4" in (p / "audit_reports" / "08_citation_check.md").read_text(encoding="utf-8")
+
+        fake.calls.clear()
+        jobs, state = we.coarse_citation_jobs(paths, ctx)
+        out = asyncio.run(we.finish_citation_check(paths, state, []))
+        assert not jobs and not fake.calls and out["reused"] == 2, "an unchanged sentence is not checked again"
+
+        ctx2 = [{**ctx[0], "sentence": "Smith~\\cite{Smith2001} gave numerical evidence for the gap.", "works": ctx[0]["works"][:1]}]
+        jobs, state = we.coarse_citation_jobs(paths, ctx2)
+        pairs_file = next((p / ".workflow").glob("04_citation_pairs_citation_1.json"))
+        assert json.loads(pairs_file.read_text(encoding="utf-8"))[0]["facts_verified_from_full_text"], "a new sentence is judged against the kept reading note"
+    finally:
+        we.fetch_full_text = orig
+        we._STATE["runtime"] = "cli"
+
+    we._STATE["wf_args"] = {"paper_dir": str(p), "effort": "low"}
+    jobs, state = we.coarse_citation_jobs(we.ensure_dirs(p), ctx2)
+    assert not jobs and not state["todo"], "effort low: no citation-context pass"
+
+
 def main() -> int:
     tests =[(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0

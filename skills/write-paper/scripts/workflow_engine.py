@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Universal, dual-mode modular orchestrator for /write-paper (v3: story first, check afterwards).
+"""Universal, dual-mode modular orchestrator for /write-paper (v4: the author decides the story, AI writes and checks).
 
 Runs inside:
 1. Antigravity `run_workflow` (via `paper_workflow.py` -> `run_from_antigravity(globals())`)
 2. Standalone Python CLI across Claude Code (`claude`), Antigravity CLI (`agy`),
    or OpenAI Codex CLI (`codex`) (via `run_paper.py` -> `run_from_cli(args_dict)`).
 
-Phases: `inventory` (material pack), `story` (lineage, story, block plan), `draft` (one author writes the
-main text block by block), `figures`, `check` (report only), `revise` (the author fixes the reported issues),
-`cleanup`, `build`, `blind_referee`; pipelines `draft_and_check`, `check_and_revise`, `full_auto`, `smoke_test`.
-v2 mode names still work (blueprint, verify, citations, hygiene, repair, draft_and_audit, audit_polish).
+`auto` looks at where the paper stands (`survey`) and runs only what is missing: `inventory` (material
+pack), `brief` (results, verified literature map, open questions; then the author and the host agent
+discuss), `story` (story, block plan and decision record from that discussion), `draft` (fills only
+missing or partial blocks), `figures`, `check` (report only), `revise`, `build`. Important findings go
+back to the author as concerns (07_feedback.json) instead of being decided by an agent. `effort`
+(low / medium / high) sets how much checking and literature work a run does. Single stages run as modes
+of the same names; v2/v3 names are aliases.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
-ENGINE_VERSION = "3.1.0"
+ENGINE_VERSION = "4.0.0"
 SKILL_DIR = Path(__file__).resolve().parent.parent
 TOOLS_DIR = SKILL_DIR / "scripts" / "tools"
 REFS_DIR = SKILL_DIR / "references"
@@ -797,7 +800,8 @@ async def dispatch_agent(
 
 _READONLY_WF_FILES = (
     "00_ground_truth_ledger.json", "00_redlines.md", "00_story_material.md", "00_style_profile.json",
-    "01_lineage.md", "01_story.md", "01_plan.json", "00_locks.json", "01_blueprint.json",
+    "01_lineage.md", "01_literature_map.md", "01_briefing.md", "01_discussion.md", "01_story.md", "01_plan.json",
+    "01_decisions.json", "01_lock.json", "07_feedback.json", "00_locks.json", "01_blueprint.json",
 )
 
 
@@ -1360,7 +1364,223 @@ MODE_ALIASES = {
     "repair": "revise",
     "draft_and_audit": "draft_and_check",
     "audit_polish": "check_and_revise",
+    "full_auto": "auto",
 }
+# Pipelines of v3 are `auto` started at a stage.
+PIPELINE_STARTS = {"draft_and_check": "draft", "check_and_revise": "check"}
+AUTO_STARTS = ("", "brief", "story", "draft", "check", "revise", "build")
+
+# How much reading, checking and literature work a run does. The writing itself is the same at every level;
+# explicit arguments (max_parallel, max_numeric_checks, revise_low) override the preset.
+EFFORT_PRESETS: Dict[str, Dict[str, Any]] = {
+    "low": {"max_parallel": 6, "lineage_steps": "3 to 5", "neighbour_clusters": "", "max_numeric_checks": 0,
+            "separate_reader": False, "check_group_bytes": 120_000, "revise_low": False, "referee": False,
+            "cite_context_batch": 0, "fulltext_works": 0},
+    "medium": {"max_parallel": 4, "lineage_steps": "4 to 8", "neighbour_clusters": "2 to 3", "max_numeric_checks": 4,
+               "separate_reader": True, "check_group_bytes": 60_000, "revise_low": False, "referee": False,
+               "cite_context_batch": 40, "fulltext_works": 8},
+    "high": {"max_parallel": 4, "lineage_steps": "5 to 10", "neighbour_clusters": "3 to 4", "max_numeric_checks": 10,
+             "separate_reader": True, "check_group_bytes": 40_000, "revise_low": True, "referee": True,
+             "cite_context_batch": 20, "fulltext_works": 20},
+}
+
+
+def effort_level(args: Optional[Dict[str, Any]] = None) -> str:
+    lvl = str((args if args is not None else _wf_args()).get("effort") or "medium").lower()
+    return lvl if lvl in EFFORT_PRESETS else "medium"
+
+
+def effort() -> Dict[str, Any]:
+    return EFFORT_PRESETS[effort_level()]
+
+
+def effort_setting(key: str, arg_name: Optional[str] = None) -> Any:
+    """An explicit argument wins over the effort preset."""
+    val = _wf_args().get(arg_name or key)
+    return effort()[key] if val is None else val
+
+
+def initial_batch_size(args: Dict[str, Any]) -> int:
+    return max(1, min(8, int(args.get("max_parallel") or EFFORT_PRESETS[effort_level(args)]["max_parallel"])))
+
+
+def only_files(paper_dir: Path) -> List[str]:
+    """`only_files`: limit draft, check and revise to these files (paper-relative)."""
+    out: List[str] = []
+    for raw in _wf_args().get("only_files") or []:
+        rel = resolve_paper_file(paper_dir, raw)
+        if rel is None:
+            raise RuntimeError(f"only_files must point inside {paper_dir}: {raw}")
+        if rel not in out:
+            out.append(rel)
+    return out
+
+
+# ------------------------------------------------------------------------------
+# Concerns for the author (human in the loop)
+#
+# The author's decisions are the current best judgement, not rules: they may rest on information that turns
+# out to be incomplete. An agent that finds such a case neither obeys silently nor overrides silently; it files
+# a concern with evidence and options. Blocking concerns stop `auto` at the next stage boundary; the others
+# wait in the list while the run goes on with the decision as it stands.
+# ------------------------------------------------------------------------------
+
+FEEDBACK_KINDS = ("evidence", "literature", "feasibility", "conflict")
+CONCERN_ITEM = {
+    "type": "object",
+    "properties": {
+        "kind": {"type": "string", "enum": list(FEEDBACK_KINDS)}, "blocking": {"type": "boolean"},
+        "finding": {"type": "string"}, "evidence": {"type": "string"}, "decision_id": {"type": "string"},
+        "options": {"type": "array", "items": {"type": "string"}}, "recommendation": {"type": "string"},
+        "affected_blocks": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["kind", "finding", "evidence"],
+}
+CONCERN_RULE = (
+    "Raise a concern only when the agreed story or one of the author's decisions may rest on something that does not hold: "
+    "evidence weaker than the decision assumed, a reference that changes what is new, a part that cannot be written as planned, "
+    "or two decisions (or a decision and a red line) in conflict. Give the evidence, the options (keeping the current decision is "
+    "always one) and your recommendation; mark it blocking only if the paper cannot go on correctly without the author's answer. "
+    "Wording, numbers, citations and length are not concerns: handle them yourself."
+)
+MAX_BLOCKING_SHOWN = 3
+
+
+def _feedback_path(wf: Path) -> Path:
+    return wf / "07_feedback.json"
+
+
+def load_feedback(wf: Path) -> Dict[str, Any]:
+    try:
+        data = json.loads(read_text_safe(_feedback_path(wf)) or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{_feedback_path(wf)} is not valid JSON ({exc.msg} at line {exc.lineno}); fix the answers there and run again")
+    items = data.get("items") if isinstance(data, dict) else None
+    return {"items": [i for i in (items or []) if isinstance(i, dict)]}
+
+
+def load_decisions(wf: Path) -> List[Dict[str, Any]]:
+    try:
+        data = json.loads(read_text_safe(wf / "01_decisions.json") or "{}")
+    except json.JSONDecodeError:
+        return []
+    items = data.get("decisions") if isinstance(data, dict) else data
+    return [d for d in (items or []) if isinstance(d, dict)]
+
+
+def open_blocking(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [i for i in data["items"] if i.get("status") == "open" and i.get("blocking")]
+
+
+def save_feedback(paths: Dict[str, Path], data: Dict[str, Any]) -> None:
+    wf = paths["wf"]
+    _feedback_path(wf).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    md = ["# Concerns for the author", "",
+          f"Answer in `{_feedback_path(wf)}`: set `answer` (the author's words), `status` to \"answered\", and `keep` to true when the "
+          "author keeps the decision as it is. Then run mode=auto again.", ""]
+    for state in ("open", "answered", "applied"):
+        items = [i for i in data["items"] if i.get("status") == state]
+        if not items:
+            continue
+        md += [f"## {state.capitalize()} ({len(items)})", ""]
+        for i in sorted(items, key=lambda x: not x.get("blocking")):
+            md.append(f"### {i['id']} [{i.get('kind', '')}{', blocking' if i.get('blocking') else ''}] from {i.get('stage', '')}")
+            md.append(f"- Finding: {i.get('finding', '')}")
+            md.append(f"- Evidence: {i.get('evidence', '')}")
+            if i.get("decision_id"):
+                md.append(f"- Decision {i['decision_id']}: {i.get('decision_choice', '')} (rested on: {i.get('decision_basis', '') or 'not recorded'})")
+            for o in i.get("options") or []:
+                md.append(f"- Option: {o}")
+            if i.get("recommendation"):
+                md.append(f"- Recommendation: {i['recommendation']}")
+            if i.get("answer"):
+                md.append(f"- Answer: {i['answer']}")
+            md.append("")
+    (paths["audit"] / "07_feedback.md").write_text("\n".join(md), encoding="utf-8")
+
+
+def add_feedback(paths: Dict[str, Path], items: Sequence[Any], stage: str) -> List[Dict[str, Any]]:
+    """File concerns raised by agents; duplicates of a concern that is still open are dropped."""
+    wf = paths["wf"]
+    data = load_feedback(wf)
+    decisions = {str(d.get("id")): d for d in load_decisions(wf)}
+
+    def key(i: Dict[str, Any]) -> Tuple[str, str, str]:
+        return (str(i.get("kind") or ""), str(i.get("decision_id") or ""), re.sub(r"\s+", " ", str(i.get("finding") or "")).strip().lower()[:80])
+
+    seen = {key(i) for i in data["items"] if i.get("status") in ("open", "answered")}
+    added: List[Dict[str, Any]] = []
+    merged = False
+    n = len(data["items"])
+    for raw in items:
+        if not isinstance(raw, dict) or not str(raw.get("finding") or "").strip():
+            continue
+        if key(raw) in seen:
+            continue
+        seen.add(key(raw))
+        # The same kind of concern about the same decision from the same stage is one question for the author:
+        # the new finding joins the open item instead of becoming another one.
+        twin = next((i for i in data["items"] if i.get("status") == "open" and i.get("stage") == stage and str(raw.get("decision_id") or "")
+                     and i.get("decision_id") == str(raw.get("decision_id")) and i.get("kind") == str(raw.get("kind") or "evidence")), None)
+        if twin is not None:
+            twin["evidence"] = f"{twin.get('evidence', '')} | Also: {raw.get('finding')} ({raw.get('evidence') or ''})".strip(" |")
+            twin["blocking"] = bool(twin.get("blocking")) or bool(raw.get("blocking"))
+            merged = True
+            continue
+        n += 1
+        kind = str(raw.get("kind") or "evidence")
+        it = {
+            "id": f"F{n}", "stage": stage, "kind": kind if kind in FEEDBACK_KINDS else "evidence", "blocking": bool(raw.get("blocking")),
+            "finding": str(raw.get("finding")), "evidence": str(raw.get("evidence") or ""), "decision_id": str(raw.get("decision_id") or ""),
+            "options": [str(o) for o in raw.get("options") or []], "recommendation": str(raw.get("recommendation") or ""),
+            "affected_blocks": [str(b) for b in raw.get("affected_blocks") or []], "status": "open", "answer": "",
+            "created": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+        d = decisions.get(it["decision_id"])
+        if d:
+            it["decision_choice"] = str(d.get("choice") or "")
+            it["decision_basis"] = str(d.get("basis") or "")
+        data["items"].append(it)
+        added.append(it)
+    if added or merged:
+        save_feedback(paths, data)
+    if added:
+        log(f"[concerns] {len(added)} new concern(s) for the author from {stage} "
+            f"({sum(1 for i in added if i['blocking'])} blocking) -> {paths['audit'] / '07_feedback.md'}")
+    return added
+
+
+def concerns_from_issues(issues: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split checker issues: those marked with `feedback_kind` go to the author (a high one blocks), the rest to revise."""
+    concerns: List[Dict[str, Any]] = []
+    rest: List[Dict[str, Any]] = []
+    for it in issues:
+        if str(it.get("feedback_kind") or "") in FEEDBACK_KINDS:
+            where = f"{it.get('file', '')}:{it.get('location', '')}".strip(":")
+            concerns.append({"kind": it["feedback_kind"], "blocking": it.get("severity") == "high", "finding": it.get("problem", ""),
+                             "evidence": "; ".join(x for x in (where, str(it.get("quote") or ""), str(it.get("evidence") or "")) if x),
+                             "decision_id": it.get("decision_id", ""), "recommendation": it.get("suggested_fix", ""),
+                             "options": ["keep the current text and decision"] + ([str(it["suggested_fix"])] if it.get("suggested_fix") else [])})
+        else:
+            rest.append(it)
+    return concerns, rest
+
+
+def decisions_note(wf: Path) -> str:
+    p = wf / "01_decisions.json"
+    return (f"The author's decisions, each with what it rests on, are in `{p}`: a choice recorded there is deliberate. " if p.exists() else "")
+
+
+def hand_edit_note(wf: Path) -> str:
+    try:
+        info = json.loads(read_text_safe(wf / "05_hand_edits.json") or "{}")
+    except json.JSONDecodeError:
+        return ""
+    files = info.get("files") or []
+    if not files:
+        return ""
+    return (f"The author edited {', '.join(files)} by hand since the last run (diff: `{info.get('diff', '')}`). Those edits are intended: "
+            "never undo them; if one conflicts with the ledger or a decision, say so instead of changing it back. ")
 
 
 def stage_refs(paths: Dict[str, Path]) -> Dict[str, Path]:
@@ -1508,6 +1728,273 @@ async def _ensure_valid_plan(plan_path: Path, ledger_path: Path) -> Dict[str, An
 
 
 # ------------------------------------------------------------------------------
+# Survey: where the paper stands (programs only)
+#
+# The workflow can start on a paper at any stage of completion. It looks at what exists, derives what is
+# missing upstream from what is there (a block plan from the .tex files, the material pack from the paper's
+# own text when no notes are given), writes only missing or partial blocks, and treats the author's hand
+# edits since the last run as intended.
+# ------------------------------------------------------------------------------
+
+_PLACEHOLDER_RE = re.compile(r"\\todo\s*\{|\bTODO\b|\[TODO|\bTBD\b|\bXXX\b")
+MIN_BLOCK_WORDS = 40
+
+
+def _strip_tex_comments(text: str) -> str:
+    return "\n".join(re.split(r"(?<!\\)%", ln, maxsplit=1)[0] for ln in text.splitlines())
+
+
+def _body(text: str) -> str:
+    """The part after \\begin{document}, if any (the skeleton preamble defines \\todo with a [TODO ...] text)."""
+    i = text.find("\\begin{document}")
+    return text[i:] if i >= 0 else text
+
+
+def prose_words(text: str) -> int:
+    t = re.sub(r"\$\$.*?\$\$|\$[^$]*\$", " ", text, flags=re.S)
+    t = re.sub(r"\\begin\{(equation|align|eqnarray|gather|multline)(\*?)\}.*?\\end\{\1\2\}", " ", t, flags=re.S)
+    t = re.sub(r"\\[A-Za-z@]+\*?", " ", t)
+    return len(re.findall(r"[A-Za-z]{2,}", t))
+
+
+def block_status(paper_dir: Path, rel: str) -> str:
+    """empty (missing or under MIN_BLOCK_WORDS words of prose), partial (has \\todo / TODO / TBD), or full."""
+    p = paper_dir / rel
+    if not p.exists():
+        return "empty"
+    text = _body(_strip_tex_comments(read_text_safe(p)))
+    if prose_words(text) < MIN_BLOCK_WORDS:
+        return "empty"
+    return "partial" if _PLACEHOLDER_RE.search(text) else "full"
+
+
+def abstract_missing(paper_dir: Path) -> bool:
+    m = re.search(r"\\begin\{abstract\}(.*?)\\end\{abstract\}", _strip_tex_comments(read_text_safe(paper_dir / "main.tex")), flags=re.S)
+    return not m or m.group(1).strip() in ("", "ABSTRACT") or prose_words(m.group(1)) < 15
+
+
+def derive_plan_from_tex(paper_dir: Path) -> Optional[Dict[str, Any]]:
+    """A block plan for a paper that exists without one: one block per input file (or main.tex itself)."""
+    main = paper_dir / "main.tex"
+    if not main.exists():
+        return None
+    blocks: List[Dict[str, Any]] = []
+    used: set = set()
+
+    def add(rel: str, part: str) -> None:
+        bid = re.sub(r"[^A-Za-z0-9]+", "-", Path(rel).stem).strip("-") or "block"
+        while bid in used:
+            bid += "b"
+        used.add(bid)
+        m = re.search(r"\\(?:section|subsection)\*?\{([^}]*)\}", read_text_safe(paper_dir / rel))
+        blocks.append({"id": bid, "part": part, "file": rel, "claim_ids": [],
+                       "purpose": f"existing text: {m.group(1).strip()}" if m else f"existing text of {rel}"})
+
+    main_inputs = main_part_files(paper_dir)[:-1]
+    for rel in main_inputs:
+        add(rel, "main")
+    if not main_inputs:
+        add("main.tex", "main")
+    supp = resolve_supplement_path(paper_dir)
+    supp_rel = _paper_rel(paper_dir, supp) if supp else None
+    if supp_rel:
+        sm_inputs = [r for r in part_files(paper_dir, supp_rel)[:-1] if r not in main_inputs]
+        for rel in sm_inputs:
+            add(rel, "sm")
+        if not sm_inputs:
+            add(supp_rel, "sm")
+    t = re.search(r"\\title\{([^}]*)\}", read_text_safe(main))
+    return {"title": t.group(1).strip() if t else "", "blocks": blocks, "figures": [], "derived_from_tex": True}
+
+
+def current_plan(paths: Dict[str, Path], save: bool = False) -> Optional[Dict[str, Any]]:
+    """The block plan, or one derived from the .tex files (saved when asked, so later stages can use it)."""
+    plan, _ = validate_plan(_plan_path())
+    if plan is not None:
+        return plan
+    derived = derive_plan_from_tex(paths["paper"])
+    if derived is not None and save:
+        _plan_path().write_text(json.dumps(derived, indent=2, ensure_ascii=False), encoding="utf-8")
+        log(f"[survey] no block plan: derived one from the .tex files ({len(derived['blocks'])} blocks) -> {_plan_path()}")
+    return derived
+
+
+def tracked_text_files(paper_dir: Path) -> List[Path]:
+    return list_editable_tex(paper_dir) + [p for p in (paper_dir / "macros.tex", paper_dir / "refs.bib") if p.exists()]
+
+
+def text_hashes(paper_dir: Path) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for p in tracked_text_files(paper_dir):
+        try:
+            out[str(p.relative_to(paper_dir)).replace("\\", "/")] = hashlib.sha256(p.read_bytes()).hexdigest()
+        except OSError:
+            pass
+    return out
+
+
+def detect_hand_edits(paths: Dict[str, Path]) -> List[str]:
+    """Files changed since the workflow last finished (by the author, by hand). The diff goes to the agents."""
+    paper_dir, wf = paths["paper"], paths["wf"]
+    try:
+        before = json.loads(read_text_safe(wf / "05_ai_hashes.json") or "{}")
+    except json.JSONDecodeError:
+        before = {}
+    info: Dict[str, Any] = {"files": [], "diff": ""}
+    if before:
+        import difflib
+        now = text_hashes(paper_dir)
+        changed = sorted(r for r, h in now.items() if before.get(r) != h)
+        chunks: List[str] = []
+        for rel in changed:
+            old = read_text_safe(wf / "05_ai_copy" / rel).splitlines(keepends=True)
+            new = read_text_safe(paper_dir / rel).splitlines(keepends=True)
+            chunks.append("".join(difflib.unified_diff(old, new, fromfile=f"workflow/{rel}", tofile=f"author/{rel}")))
+        if changed:
+            diff_path = wf / "05_hand_edits.diff"
+            diff_path.write_text("\n".join(chunks), encoding="utf-8")
+            info = {"files": changed, "diff": str(diff_path)}
+            log(f"[survey] hand edits since the last run (treated as intended): {changed}")
+    (wf / "05_hand_edits.json").write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
+    return info["files"]
+
+
+def remember_text(paths: Dict[str, Path], before: Optional[Dict[str, str]] = None) -> None:
+    """Record what the workflow itself changed in this run (files whose hash differs from `before`), so the next
+    run's remaining differences are the author's hand edits. A file the run did not touch keeps its old record:
+    a hand edit stays visible to later runs until an agent has worked on that file. The first run records all."""
+    paper_dir, wf = paths["paper"], paths["wf"]
+    copy_dir = wf / "05_ai_copy"
+    hashes_path = wf / "05_ai_hashes.json"
+    try:
+        stored = json.loads(read_text_safe(hashes_path) or "{}")
+    except json.JSONDecodeError:
+        stored = {}
+    now = text_hashes(paper_dir)
+    if not stored or before is None:
+        force_rmtree(copy_dir)
+        stored, changed, removed = {}, set(now), set()
+    else:
+        changed = {r for r, h in now.items() if before.get(r) != h}
+        removed = {r for r in before if r not in now}
+    for rel in changed:
+        copy_to_workflow(paper_dir / rel, copy_dir / rel)
+        stored[rel] = now[rel]
+    for rel in removed:
+        stored.pop(rel, None)
+        if (copy_dir / rel).exists():
+            clear_readonly(copy_dir / rel)
+            (copy_dir / rel).unlink()
+    hashes_path.write_text(json.dumps(stored, indent=1), encoding="utf-8")
+
+
+def _lock_hashes(wf: Path) -> Dict[str, str]:
+    return {n: _file_sha(wf / n) for n in ("01_story.md", "01_plan.json", "01_decisions.json") if (wf / n).exists()}
+
+
+def lock_valid(wf: Path) -> bool:
+    try:
+        lock = json.loads(read_text_safe(wf / "01_lock.json") or "{}")
+    except json.JSONDecodeError:
+        return False
+    return bool(lock.get("hashes")) and lock.get("hashes") == _lock_hashes(wf)
+
+
+def _load_rewrite(wf: Path) -> Dict[str, str]:
+    try:
+        data = json.loads(read_text_safe(wf / "01_rewrite.json") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def mark_rewrite(wf: Path, items: Sequence[Any]) -> Dict[str, str]:
+    cur = _load_rewrite(wf)
+    for it in items:
+        if isinstance(it, dict) and str(it.get("block") or "").strip():
+            cur[str(it["block"])] = str(it.get("why") or "the story changed")
+    (wf / "01_rewrite.json").write_text(json.dumps(cur, indent=2, ensure_ascii=False), encoding="utf-8")
+    return cur
+
+
+async def lock_story(paths: Dict[str, Path]) -> Dict[str, Any]:
+    """The author confirmed the story, plan and decisions. Plan blocks whose job changed since the last lock are
+    marked for rewriting (a block that is new or empty is written anyway)."""
+    wf = paths["wf"]
+    plan = await _ensure_valid_plan(_plan_path(), wf / "00_ground_truth_ledger.json")
+    if not (wf / "01_decisions.json").exists():
+        (wf / "01_decisions.json").write_text(json.dumps({"decisions": []}, indent=2), encoding="utf-8")
+    try:
+        old = json.loads(read_text_safe(wf / "01_lock.json") or "{}")
+    except json.JSONDecodeError:
+        old = {}
+    old_blocks = {b.get("id"): b for b in (old.get("plan_blocks") or []) if isinstance(b, dict)}
+    changed = [{"block": b["id"], "why": f"its job in the plan changed: {b['purpose']}"} for b in plan["blocks"]
+               if b["id"] in old_blocks and any(old_blocks[b["id"]].get(k) != b.get(k) for k in ("purpose", "claim_ids", "file", "part"))]
+    if changed:
+        mark_rewrite(wf, changed)
+    (wf / "01_lock.json").write_text(json.dumps({"locked": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), "hashes": _lock_hashes(wf),
+                                                 "plan_blocks": plan["blocks"]}, indent=2, ensure_ascii=False), encoding="utf-8")
+    log(f"[story] locked{f'; {len(changed)} block(s) to rewrite because their job changed' if changed else ''}")
+    return {"locked": True, "rewrite": [c["block"] for c in changed]}
+
+
+def run_survey(paths: Dict[str, Path]) -> Dict[str, Any]:
+    """Where the paper stands and what `auto` would do next. Programs only; no agent is called."""
+    paper_dir, wf = paths["paper"], paths["wf"]
+    plan = current_plan(paths)
+    blocks = [{"id": b["id"], "part": b["part"], "file": b["file"], "status": block_status(paper_dir, b["file"])} for b in (plan or {}).get("blocks", [])]
+    fb = load_feedback(wf)
+    hand = json.loads(read_text_safe(wf / "05_hand_edits.json") or "{}").get("files") or []
+    try:
+        checked = json.loads(read_text_safe(wf / "06_checked_hashes.json") or "{}")
+    except json.JSONDecodeError:
+        checked = {}
+    has_text = any(b["status"] != "empty" for b in blocks)
+    st = {
+        "effort": effort_level(),
+        "sources": len(collect_source_files(list(_wf_args().get("source_paths") or []) + list(_wf_args().get("authority_paths") or []))),
+        "plan": "none" if plan is None else ("derived from the .tex files" if plan.get("derived_from_tex") else "01_plan.json"),
+        "blocks": blocks,
+        "abstract_missing": abstract_missing(paper_dir) if (paper_dir / "main.tex").exists() else True,
+        "artifacts": {n: (wf / n).exists() for n in ("00_ground_truth_ledger.json", "01_briefing.md", "01_discussion.md", "01_story.md", "01_decisions.json")},
+        "story_locked": lock_valid(wf),
+        "rewrite": _load_rewrite(wf),
+        "hand_edits": hand,
+        "concerns": {s: sum(1 for i in fb["items"] if i.get("status") == s) for s in ("open", "answered", "applied")},
+        "blocking": len(open_blocking(fb)),
+        "checked_since_last_change": bool(checked) and checked == text_hashes(paper_dir),
+    }
+    to_write = [b["file"] for b in blocks if b["status"] != "full"] + list(st["rewrite"])
+    if st["concerns"]["answered"]:
+        nxt = "apply the author's answers to the concerns"
+    elif st["blocking"]:
+        nxt = "wait for the author's answers to blocking concerns"
+    elif not has_text and not st["artifacts"]["01_story.md"]:
+        nxt = "briefing, then the story discussion with the author"
+    elif not st["story_locked"] and (to_write or st["abstract_missing"]) and st["artifacts"]["01_story.md"]:
+        nxt = "confirm and lock the story, then write the missing blocks"
+    elif not st["story_locked"] and (to_write or st["abstract_missing"]):
+        nxt = "briefing (with the story the draft tells now), then the story discussion with the author"
+    elif to_write or st["abstract_missing"]:
+        nxt = f"write {len(to_write)} missing or partial block(s)" + (" and the abstract" if st["abstract_missing"] else "")
+    elif not st["checked_since_last_change"]:
+        nxt = "check, revise and build"
+    else:
+        nxt = "nothing: the text has not changed since the last check"
+    st["next"] = nxt
+    (wf / "00_survey.json").write_text(json.dumps(st, indent=2, ensure_ascii=False), encoding="utf-8")
+    md = ["# Where the paper stands", "", f"- Effort: {st['effort']}", f"- Source files: {st['sources']}", f"- Block plan: {st['plan']}",
+          f"- Story locked: {st['story_locked']}", f"- Abstract missing: {st['abstract_missing']}",
+          f"- Hand edits since the last run: {', '.join(hand) or 'none'}",
+          f"- Concerns: {st['concerns']['open']} open ({st['blocking']} blocking), {st['concerns']['answered']} answered",
+          f"- Next: {nxt}", "", "| block | part | file | status |", "|---|---|---|---|"]
+    md += [f"| {b['id']} | {b['part']} | {b['file']} | {b['status']}{' (rewrite)' if b['id'] in st['rewrite'] else ''} |" for b in blocks]
+    (paths["audit"] / "00_survey.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    return st
+
+
+# ------------------------------------------------------------------------------
 # Stage 0: material pack
 # ------------------------------------------------------------------------------
 
@@ -1592,6 +2079,13 @@ async def run_inventory(paths: Dict[str, Path]) -> Dict[str, Any]:
     skipped_sources: List[str] = []
     authority_files = collect_source_files(args.get("authority_paths") or [], skipped_sources)
     source_files = collect_source_files(args.get("source_paths") or [], skipped_sources)
+    if not authority_files and not source_files:
+        # A paper that exists without its notes: its own text is the material (results only it states are then
+        # checked against nothing else, so the checkers say so).
+        source_files = list_editable_tex(paths["paper"])
+        if not source_files:
+            raise RuntimeError("inventory: nothing to work from; give source_paths (the notes) or a paper directory that has text")
+        log(f"Stage 0: no notes given; the material pack is built from the paper's own {len(source_files)} .tex files")
     auth_set = {f.resolve() for f in authority_files}
     other_files = [f for f in source_files if f.resolve() not in auth_set]
     exemplar_paths = [str(Path(x)) for x in (args.get("exemplar_paths") or [])]
@@ -1809,6 +2303,11 @@ def verify_lineage_refs(steps: List[Dict[str, Any]], seed_bib: Path, cache: Path
         if not (res and res.get("verified") and res.get("bibtex")):
             continue
         s["verified"] = True
+        md = res.get("metadata") or {}
+        authors = md.get("authors") if isinstance(md.get("authors"), list) else []
+        s["meta"] = {"title": str(md.get("title") or s.get("title") or ""), "year": str(md.get("year") or s.get("year") or ""),
+                     "authors": [str(a) for a in authors[:3]], "abstract": str(md.get("abstract") or ""),
+                     "arxiv": str(md.get("arxiv") or s.get("arxiv") or "")}
         bib = str(res["bibtex"]).strip()
         km = re.match(r"@\w+\s*\{\s*([^,\s]+)", bib)
         if km:
@@ -1826,8 +2325,7 @@ def render_lineage(steps: List[Dict[str, Any]], this_paper: str) -> str:
     lines = ["# Lineage", "", "Each reference was checked with verify_citations.py. Cite verified ones by their key; an unverified "
              "step may be told, but its citation stays \\cite{TODO:...} until someone verifies it.", ""]
     for i, s in enumerate(steps, 1):
-        ident = s.get("doi") or s.get("arxiv") or "no identifier"
-        ref = f"[verified: {s['cite_key']}]" if s.get("verified") and s.get("cite_key") else ("[verified]" if s.get("verified") else f"[unverified: {ident}]")
+        ref = _ref_tag(s)
         lines.append(f"{i}. **{s.get('year', '')} {s.get('who', '')}** {ref}")
         lines.append(f"   - Question: {s.get('question', '')}")
         lines.append(f"   - Found: {s.get('found', '')}")
@@ -1838,21 +2336,64 @@ def render_lineage(steps: List[Dict[str, Any]], this_paper: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-async def run_story(paths: Dict[str, Path], inv_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    wf = paths["wf"]
-    paper_dir = paths["paper"]
-    args = _wf_args()
-    genre = str(args.get("genre") or "long")
-    phase("Stage 1: Lineage, Story and Block Plan")
-    refs = stage_refs(paths)
+NEIGHBOUR_WORK = {
+    "type": "object",
+    "properties": {"who": {"type": "string"}, "year": {"type": "string"}, "title": {"type": "string"}, "doi": {"type": "string"},
+                   "arxiv": {"type": "string"}, "note": {"type": "string"}, "relation": {"type": "string"}},
+    "required": ["title"],
+}
+NEIGHBOUR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "clusters": {"type": "array", "items": {"type": "object", "properties": {
+            "name": {"type": "string"}, "what_they_do": {"type": "string"}, "limitation": {"type": "string"},
+            "relation": {"type": "string"}, "works": {"type": "array", "items": NEIGHBOUR_WORK}}, "required": ["name", "works"]}},
+        "concurrent": {"type": "array", "items": NEIGHBOUR_WORK},
+    },
+    "required": ["clusters"],
+}
+STORY_SCHEMA = {
+    "type": "object",
+    "properties": {"rewrite": {"type": "array", "items": {"type": "object", "properties": {"block": {"type": "string"}, "why": {"type": "string"}}, "required": ["block"]}}},
+    "required": ["rewrite"],
+}
 
+
+def _ref_tag(w: Dict[str, Any]) -> str:
+    ident = w.get("doi") or w.get("arxiv") or "no identifier"
+    check = f" {w['check']}" if w.get("check") else ""
+    if w.get("verified"):
+        return (f"[verified: {w['cite_key']}]" if w.get("cite_key") else "[verified]") + check
+    return f"[unverified: {ident}]"
+
+
+def render_literature_map(steps: List[Dict[str, Any]], this_paper: str, clusters: List[Dict[str, Any]], concurrent: List[Dict[str, Any]]) -> str:
+    lines = [render_lineage(steps, this_paper).rstrip(), ""]
+    if clusters:
+        lines += ["# Neighbouring work", ""]
+        for c in clusters:
+            lines.append(f"## {c.get('name', '')}")
+            for k, lab in (("what_they_do", "What they do"), ("limitation", "Where they stop"), ("relation", "Relation to this paper")):
+                if c.get(k):
+                    lines.append(f"- {lab}: {c[k]}")
+            for w in c.get("works") or []:
+                lines.append(f"  - {w.get('who', '')} {w.get('year', '')}: {w.get('title', '')} {_ref_tag(w)}" + (f" ({w['note']})" if w.get("note") else ""))
+            lines.append("")
+    if concurrent:
+        lines += ["# Concurrent or later work (never prior work)", ""]
+        for w in concurrent:
+            lines.append(f"- {w.get('who', '')} {w.get('year', '')}: {w.get('title', '')} {_ref_tag(w)}" + (f" ({w['relation']})" if w.get("relation") else ""))
+    return "\n".join(lines) + "\n"
+
+
+def _seed_and_hints(paths: Dict[str, Path], inv_info: Optional[Dict[str, Any]]) -> Tuple[Path, List[str]]:
+    wf = paths["wf"]
     seed_bib_path = wf / "01_verified_seed.bib"
-    existing_bib = args.get("existing_bib")
+    existing_bib = _wf_args().get("existing_bib")
     if existing_bib and Path(existing_bib).exists():
         copy_to_workflow(Path(existing_bib), seed_bib_path)
     elif not seed_bib_path.exists():
         seed_bib_path.write_text("", encoding="utf-8")
-
     hints_src = (inv_info or {}).get("cited_seed_hints")
     hints_file = wf / "00_cited_seed_hints.json"
     if hints_src is None and hints_file.exists():
@@ -1860,62 +2401,259 @@ async def run_story(paths: Dict[str, Path], inv_info: Optional[Dict[str, Any]] =
             hints_src = json.loads(read_text_safe(hints_file))
         except json.JSONDecodeError:
             hints_src = []
-    hints = [str(h) for h in (hints_src or [])][:20]
+    return seed_bib_path, [str(h) for h in (hints_src or [])][:20]
 
+
+def _work_from_meta(w: Dict[str, Any]) -> Dict[str, Any]:
+    md = w.get("meta") or {}
+    return {"key": w["cite_key"], "title": md.get("title") or w.get("title", ""), "year": md.get("year") or w.get("year", ""),
+            "authors": md.get("authors") or [], "abstract": md.get("abstract") or "(no abstract available)",
+            "arxiv": md.get("arxiv") or w.get("arxiv", ""), "literature_map": ""}
+
+
+async def check_literature_claims(paths: Dict[str, Path], steps: List[Dict[str, Any]], clusters: List[Dict[str, Any]],
+                                  concurrent: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """What the map says each verified work did is checked like a citation (abstract first, the lineage steps and
+    concurrent works in full when the abstract cannot settle it), so the author decides on checked facts."""
+    if not effort()["cite_context_batch"]:
+        return None
+    ctx: List[Dict[str, Any]] = []
+    owners: List[Dict[str, Any]] = []
+    for i, s in enumerate(steps, 1):
+        if s.get("verified") and s.get("cite_key"):
+            ctx.append({"file": "01_literature_map.md", "line": f"lineage {i}", "key_context": True, "works": [_work_from_meta(s)],
+                        "sentence": f"{s.get('who', '')} ({s.get('year', '')}) asked: {s.get('question', '')} Found: {s.get('found', '')}"
+                                    + (f" Left open: {s['left_open']}" if s.get("left_open") else "")})
+            owners.append(s)
+    for c in clusters:
+        for w in c.get("works") or []:
+            if w.get("verified") and w.get("cite_key"):
+                ctx.append({"file": "01_literature_map.md", "line": f"cluster {c.get('name', '')}", "works": [_work_from_meta(w)],
+                            "sentence": f"{c.get('name', '')}: {c.get('what_they_do', '')} Where they stop: {c.get('limitation', '')}"
+                                        + (f" This work: {w['note']}" if w.get("note") else "")})
+                owners.append(w)
+    for w in concurrent:
+        if w.get("verified") and w.get("cite_key"):
+            ctx.append({"file": "01_literature_map.md", "line": "concurrent", "key_context": True, "works": [_work_from_meta(w)],
+                        "sentence": f"Concurrent with or later than this paper's results: {w.get('relation', '')}"})
+            owners.append(w)
+    if not ctx:
+        return None
+    jobs, state = coarse_citation_jobs(paths, ctx, role="Literature Check")
+    res = await finish_citation_check(paths, state, await run_batched(jobs, lambda j: j[1]()) if jobs else [], "08_literature_map_check.md")
+    by_line = {f"c{i}:{c['works'][0]['key']}": owner for i, (c, owner) in enumerate(zip(ctx, owners), 1)}
+    for v in res["verdicts"]:
+        owner = by_line.get(v["id"])
+        if owner is None:
+            continue
+        where = f", {v['location']}" if v.get("location") else ""
+        if v["verdict"] == "supported":
+            owner["check"] = f"[claim confirmed: {v['level']}{where}]"
+        elif v["verdict"] == "unclear":
+            owner["check"] = f"[claim unclear: {v['level']}{', full text unavailable' if v.get('fulltext') == 'unavailable' else ''}]"
+        else:
+            owner["check"] = f"[claim not supported: {v['verdict'].replace('_', ' ')}: {v.get('problem', '')}]"
+    return {k: res[k] for k in ("reused", "fulltext_read", "fulltext_unavailable", "report")}
+
+
+async def run_brief(paths: Dict[str, Path], inv_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """What the author needs to decide the story: results with their evidence, a verified literature map and the
+    open questions. Information only: no storyline and no recommendation (the author speaks first)."""
+    wf = paths["wf"]
+    paper_dir = paths["paper"]
+    genre = str(_wf_args().get("genre") or "long")
+    sm_word = "Supplemental Material" if genre == "letter" else "appendices"
+    phase("Briefing: results, literature map and open questions for the author")
+    refs = stage_refs(paths)
+    seed_bib_path, hints = _seed_and_hints(paths, inv_info)
     ledger_path = wf / "00_ground_truth_ledger.json"
     material_path = wf / "00_story_material.md"
-    redlines_path = wf / "00_redlines.md"
-    conflicts_path = wf / "00_conflicts_report.md"
-    lineage_path = wf / "01_lineage.md"
-    story_path = wf / "01_story.md"
-    plan_path = _plan_path()
-    macros_path = paper_dir / "macros.tex"
     if not ledger_path.exists():
-        raise RuntimeError(f"story: {ledger_path} is missing; run mode=inventory first")
-
+        raise RuntimeError(f"brief: {ledger_path} is missing; run mode=inventory first")
     vc_query = f"{resolve_python_exe()} {TOOLS_DIR / 'verify_citations.py'} verify-entry --query"
     hint_txt = f" Works the notes cite: {json.dumps(hints, ensure_ascii=False)}." if hints else ""
-    lineage = await dispatch_agent(
+    find_rule = (f"For each work, find it with `{vc_query} \"<title words, first author, year>\"` (this only lists candidates) and report the DOI "
+                 f"or arXiv id and the exact title of the right candidate; the workflow verifies them itself. Leave out what you cannot identify "
+                 f"that way, and never invent a reference.")
+    eff = effort()
+    jobs: List[Tuple[str, Callable[[], Any]]] = [("lineage", lambda: dispatch_agent(
         f"Trace the history that leads to this paper's question. Read `{material_path}` and `{ledger_path}`.{hint_txt}\n"
-        f"Give 4 to 8 steps of earlier work in time order (who, when, what question they asked, what they found, what they left open), and put "
-        f"the step this paper takes in `this_paper`, not among the steps. For a step that rests on a paper, find it with `{vc_query} \"<title words, first author, year>\"` (this only lists "
-        f"candidates) and report the DOI or arXiv id and the exact title of the right candidate; the workflow verifies them itself. Leave out "
-        f"what you cannot identify that way, and never invent a reference.",
-        schema=LINEAGE_SCHEMA,
-        role="Lineage",
-        stage_name="story",
-        tier="heavy",
-    )
-    lineage = _require_fields(lineage, ["steps"], "Lineage")
+        f"Give {eff['lineage_steps']} steps of earlier work in time order (who, when, what question they asked, what they found, what they left "
+        f"open), and put the step this paper takes in `this_paper`, not among the steps. {find_rule}",
+        schema=LINEAGE_SCHEMA, role="Lineage", stage_name="story", tier="heavy"))]
+    if eff["neighbour_clusters"]:
+        jobs.append(("neighbours", lambda: dispatch_agent(
+            f"Map the work around this paper's question. Read `{material_path}` and `{ledger_path}`.{hint_txt}\n"
+            f"1. `clusters`: {eff['neighbour_clusters']} groups of neighbouring work a referee would compare this paper with. For each: what "
+            f"they do, where they stop (the limitation that matters here), how this paper relates to them, and its key works.\n"
+            f"2. `concurrent`: work that appeared at the same time as these results or later and overlaps them; it is concurrent work, never "
+            f"prior work.\n{find_rule}",
+            schema=NEIGHBOUR_SCHEMA, role="Neighbouring Work", stage_name="story", tier="heavy")))
+    results = dict(zip([j[0] for j in jobs], await run_batched(jobs, lambda j: j[1]())))
+    lineage = _require_fields(results["lineage"], ["steps"], "Lineage")
     steps = [s for s in (lineage.get("steps") or []) if isinstance(s, dict)]
-    added = verify_lineage_refs(steps, seed_bib_path, wf / "04_api_bib_cache.json")
-    lineage_path.write_text(render_lineage(steps, str(lineage.get("this_paper") or "")), encoding="utf-8")
-    log(f"Lineage: {len(steps)} steps, {sum(1 for s in steps if s.get('verified'))} references verified, {added} added to the seed .bib")
+    nb = results.get("neighbours") if isinstance(results.get("neighbours"), dict) else {}
+    clusters = [c for c in (nb.get("clusters") or []) if isinstance(c, dict)]
+    concurrent = [w for w in (nb.get("concurrent") or []) if isinstance(w, dict)]
+    works = [w for c in clusters for w in (c.get("works") or []) if isinstance(w, dict)] + concurrent
+    cache = wf / "04_api_bib_cache.json"
+    added = verify_lineage_refs(steps, seed_bib_path, cache) + verify_lineage_refs(works, seed_bib_path, cache)
+    lit_check = await check_literature_claims(paths, steps, clusters, concurrent)
+    this_paper = str(lineage.get("this_paper") or "")
+    lineage_path = wf / "01_lineage.md"
+    lineage_path.write_text(render_lineage(steps, this_paper), encoding="utf-8")
+    litmap_path = wf / "01_literature_map.md"
+    litmap_path.write_text(render_literature_map(steps, this_paper, clusters, concurrent), encoding="utf-8")
+    n_ver = sum(1 for x in steps + works if x.get("verified"))
+    log(f"Literature map: {len(steps)} lineage steps, {len(clusters)} neighbouring clusters, {len(concurrent)} concurrent works; "
+        f"{n_ver} references verified, {added} added to the seed .bib")
 
+    plan = current_plan(paths)
+    written = [(b["file"], block_status(paper_dir, b["file"])) for b in (plan or {}).get("blocks", [])]
+    written = [(f, s) for f, s in written if s != "empty"]
+    draft_txt = (f" The paper already has text ({', '.join(f'{f}: {s}' for f, s in written)}; main file `{paper_dir / 'main.tex'}`)." if written else "")
+    brief_path = wf / "01_briefing.md"
+    sections = [
+        "Results: the core results in logical order (what rests on what). For each: its ledger id, one plain sentence, the evidence "
+        "(proven, numerical or conjectured, with the source), its scope, and what is new against the literature map (with the references).",
+        "Literature: the lineage and the neighbouring work in a few lines each; concurrent work separately.",
+    ]
+    if written:
+        sections.append("The draft as it stands: the story the existing text tells now (abstract, introduction, order of sections), quoted briefly.")
+    sections += [
+        "Limits: the venue's limits for this genre and the author's red lines.",
+        f"Open questions for the author: the decisions the paper needs (the headline, the framing and the terms, main text versus {sm_word}, "
+        "what to leave out, anything the material leaves undecided), as questions only.",
+    ]
+    res = await dispatch_agent(
+        f"Write `{brief_path}`: the briefing the author reads before deciding the story and the structure of the paper (genre: {genre}). It gives "
+        "information, not advice: do not propose a storyline, do not rank the results by importance, and do not recommend. The author says "
+        "what they think first; the AI's own view comes afterwards, in conversation.\n"
+        f"Read the ledger `{ledger_path}`, the story material `{material_path}`, the red lines `{wf / '00_redlines.md'}`, the notation "
+        f"conflicts `{wf / '00_conflicts_report.md'}`, the literature map `{litmap_path}` and the genre notes "
+        f"`{refs.get('genre_templates.md', REFS_DIR / 'genre_templates.md')}`.{draft_txt} In the map, a claim about a work marked "
+        "[claim not supported ...] or [claim unclear ...] is not a fact: leave it out or say it is unconfirmed.\nSections:\n"
+        + "\n".join(f"{k}. {s}" for k, s in enumerate(sections, 1))
+        + "\nPlain language, readable in ten minutes. Reply with the number of open questions.",
+        schema={"type": "object", "properties": {"open_questions": {"type": "integer"}}, "required": ["open_questions"]},
+        role="Briefing", stage_name="story", tier="heavy",
+    )
+    if not brief_path.exists():
+        raise RuntimeError(f"brief: the briefing agent did not write {brief_path}")
+    return {"brief": str(brief_path), "literature_map": str(litmap_path), "lineage_steps": len(steps), "clusters": len(clusters),
+            "concurrent": len(concurrent), "verified_refs": n_ver, "literature_check": lit_check,
+            "open_questions": res.get("open_questions") if isinstance(res, dict) else None}
+
+
+async def run_story(paths: Dict[str, Path], inv_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Story, block plan and decision record, written from the author's discussion of the briefing (or, in an
+    unattended run, chosen by the agent and marked as such)."""
+    wf = paths["wf"]
+    paper_dir = paths["paper"]
+    genre = str(_wf_args().get("genre") or "long")
     sm_word = "Supplemental Material" if genre == "letter" else "appendices"
-    await dispatch_agent(
-        f"Plan this paper together with its author. Read the ledger `{ledger_path}`, the story material `{material_path}`, the lineage "
-        f"`{lineage_path}`, the red lines `{redlines_path}`, the notation conflicts `{conflicts_path}` and the genre notes "
-        f"`{refs.get('genre_templates.md', REFS_DIR / 'genre_templates.md')}` (genre: {genre}). Write three files.\n"
-        f"1. `{story_path}`: one page the author reads before anything is drafted, in plain language: the question in one sentence; the "
-        f"lineage that leads to it; why it is still open; the answer in plain words; why it matters; what goes into the main text, what goes "
-        f"to the {sm_word} and what is left out (by ledger id); the block plan below, in prose; two or three title candidates.\n"
+    phase("Story, block plan and decision record")
+    refs = stage_refs(paths)
+    ledger_path = wf / "00_ground_truth_ledger.json"
+    if not ledger_path.exists():
+        raise RuntimeError(f"story: {ledger_path} is missing; run mode=inventory first")
+    litmap_path = wf / "01_literature_map.md"
+    if not litmap_path.exists():
+        log("[story] no literature map yet; writing the briefing first")
+        await run_brief(paths, inv_info)
+    brief_path = wf / "01_briefing.md"
+    disc_path = wf / "01_discussion.md"
+    story_path = wf / "01_story.md"
+    decisions_path = wf / "01_decisions.json"
+    plan_path = _plan_path()
+    macros_path = paper_dir / "macros.tex"
+    plan_now = current_plan(paths)
+    written = [f"{b['file']} ({block_status(paper_dir, b['file'])})" for b in (plan_now or {}).get("blocks", [])
+               if block_status(paper_dir, b["file"]) != "empty"]
+    disc_txt = (
+        f"The author discussed the briefing with the AI; the agreed points are in `{disc_path}`. Follow them. Where they say nothing, choose "
+        "yourself and list those choices in the story under the heading 'Filled in by the AI', so the author sees them.\n"
+        if disc_path.exists() else
+        "Nobody discussed the briefing (an unattended run): choose yourself, and give every decision the source \"ai\".\n"
+    )
+    existing_txt = (f"The paper already has text: {', '.join(written)}. Keep a block's existing file name where the block still serves the "
+                    "plan. A complete block is not rewritten unless you list it under `rewrite` with the reason.\n" if written else "")
+    res = await dispatch_agent(
+        f"Write the story of this paper. Read the briefing `{brief_path}`, the ledger `{ledger_path}`, the story material "
+        f"`{wf / '00_story_material.md'}`, the literature map `{litmap_path}`, the red lines `{wf / '00_redlines.md'}`, the notation "
+        f"conflicts `{wf / '00_conflicts_report.md'}` and the genre notes `{refs.get('genre_templates.md', REFS_DIR / 'genre_templates.md')}` "
+        f"(genre: {genre}).\n{disc_txt}{existing_txt}Write four files.\n"
+        f"1. `{story_path}`: one page in plain language: the question in one sentence; the history that leads to it; why it is still open; "
+        f"the answer in plain words; why it matters; what goes into the main text, what goes to the {sm_word} and what is left out (by "
+        f"ledger id); the block plan in prose; two or three title candidates.\n"
         f"2. `{plan_path}`: the same plan as strict JSON: {{\"title\": str, \"blocks\": [{{\"id\": str, \"part\": \"main\" or \"sm\", "
         f"\"file\": \"sections/<name>.tex\", \"purpose\": one sentence, \"claim_ids\": [ledger ids], \"figure_ids\": [figure ids], "
         f"\"target_words\": int}}], \"figures\": [{{\"id\": str, \"purpose\": str, \"claim_ids\": [ledger ids]}}]}}. Main-text blocks follow "
         f"the logical beats of the story in reading order, the question and its history first; {sm_word} blocks hold the proofs and technical "
         f"detail. Name results only by ledger id; never restate them in the plan.\n"
-        f"3. `{macros_path}`: LaTeX macros for the notation, resolving the conflicts; a run-in heading macro must begin with `\\par`.",
-        schema={"type": "string"},
+        f"3. `{decisions_path}`: the decision record as strict JSON: {{\"decisions\": [{{\"id\": \"D1\", \"topic\": str, \"choice\": str, "
+        f"\"reason\": str, \"basis\": what it rests on (ledger ids, references, the author's words), \"unknown_then\": what was not known "
+        f"when it was made, \"affects\": [block ids], \"source\": \"author\" or \"ai\", \"version\": 1}}]}}, one entry per real choice (the "
+        f"headline, the framing and the terms, main text versus {sm_word}, what is left out).\n"
+        f"4. `{macros_path}`: LaTeX macros for the notation, resolving the conflicts (if the file exists, keep it and add only what is "
+        f"missing); a run-in heading macro must begin with `\\par`.\n"
+        "Reply with `rewrite`: existing blocks whose text must be rewritten for this story (block id and why); an empty list when none.",
+        schema=STORY_SCHEMA,
         role="Story and Plan",
         stage_name="story",
         tier="heavy",
     )
     plan = await _ensure_valid_plan(plan_path, ledger_path)
+    ids = {b["id"] for b in plan["blocks"]}
+    rewrite = [r for r in ((res or {}).get("rewrite") if isinstance(res, dict) else None) or [] if isinstance(r, dict) and str(r.get("block")) in ids]
+    if rewrite:
+        mark_rewrite(wf, rewrite)
+    if not decisions_path.exists():
+        decisions_path.write_text(json.dumps({"decisions": []}, indent=2), encoding="utf-8")
     n_main = sum(1 for b in plan["blocks"] if b["part"] == "main")
-    log(f"Story stage complete: {n_main} main-text blocks, {len(plan['blocks']) - n_main} {sm_word} blocks. Read {story_path} before drafting.")
-    return {"story": str(story_path), "plan": str(plan_path), "lineage": str(lineage_path), "macros": str(macros_path),
-            "main_blocks": n_main, "sm_blocks": len(plan["blocks"]) - n_main}
+    log(f"Story stage complete: {n_main} main-text blocks, {len(plan['blocks']) - n_main} {sm_word} blocks, "
+        f"{len(load_decisions(wf))} decisions recorded{f', {len(rewrite)} existing block(s) to rewrite' if rewrite else ''}.")
+    return {"story": str(story_path), "plan": str(plan_path), "decisions": str(decisions_path), "macros": str(macros_path),
+            "main_blocks": n_main, "sm_blocks": len(plan["blocks"]) - n_main, "rewrite": [r["block"] for r in rewrite],
+            "from_discussion": disc_path.exists()}
+
+
+async def apply_feedback(paths: Dict[str, Path]) -> Dict[str, Any]:
+    """The author answered concerns. Answers that keep a decision change nothing; the others update the story,
+    plan and decision record (one agent call), and the blocks they touch are rewritten by the next draft."""
+    wf = paths["wf"]
+    data = load_feedback(wf)
+    answered = [i for i in data["items"] if i.get("status") == "answered"]
+    if not answered:
+        return {"applied": 0}
+    changes = [i for i in answered if not i.get("keep")]
+    rewrite: List[Dict[str, Any]] = []
+    if changes:
+        phase(f"Apply the author's answers to {len(changes)} concern(s)")
+        current_plan(paths, save=True)
+        ledger_path = wf / "00_ground_truth_ledger.json"
+        brief = [{k: i.get(k) for k in ("id", "finding", "evidence", "decision_id", "options", "answer")} for i in changes]
+        res = await dispatch_agent(
+            f"The author answered these concerns about the paper:\n{json.dumps(brief, indent=1, ensure_ascii=False)}\n"
+            f"Update the story `{wf / '01_story.md'}` (if it exists), the block plan `{_plan_path()}` and the decision record "
+            f"`{wf / '01_decisions.json'}` (create it if missing, as {{\"decisions\": [...]}}) to follow the answers. For a changed decision raise "
+            f"its `version`, update `choice`, `reason` and `basis`, and add a short `history` entry (date, what changed, why). Change nothing "
+            f"the answers do not touch; keep the JSON strict and every claim id in the ledger `{ledger_path}`.\n"
+            "Reply with `rewrite`: the blocks whose text must change (block id and why, naming the answer); an empty list when none.",
+            schema=STORY_SCHEMA, role="Apply Answers", stage_name="story", tier="heavy",
+        )
+        plan = await _ensure_valid_plan(_plan_path(), ledger_path)
+        ids = {b["id"] for b in plan["blocks"]}
+        rewrite = [r for r in ((res or {}).get("rewrite") if isinstance(res, dict) else None) or [] if isinstance(r, dict) and str(r.get("block")) in ids]
+        mark_rewrite(wf, rewrite)
+        if (wf / "01_lock.json").exists():
+            await lock_story(paths)  # the author's answer confirms the updated story
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    for i in answered:
+        i["status"], i["applied"] = "applied", stamp
+    save_feedback(paths, data)
+    log(f"[concerns] applied {len(answered)} answer(s); {len(changes)} changed the story or a decision; blocks to rewrite: {[r['block'] for r in rewrite]}")
+    return {"applied": len(answered), "changed": len(changes), "rewrite": [r["block"] for r in rewrite]}
 
 
 # ------------------------------------------------------------------------------
@@ -1924,7 +2662,8 @@ async def run_story(paths: Dict[str, Path], inv_info: Optional[Dict[str, Any]] =
 
 BLOCK_SCHEMA = {
     "type": "object",
-    "properties": {"file": {"type": "string"}, "words": {"type": "integer"}, "todos": {"type": "array", "items": {"type": "string"}}},
+    "properties": {"file": {"type": "string"}, "words": {"type": "integer"}, "todos": {"type": "array", "items": {"type": "string"}},
+                   "concerns": {"type": "array", "items": CONCERN_ITEM}},
     "required": ["file"],
 }
 
@@ -1958,61 +2697,87 @@ def author_system_prompt(m: Dict[str, str], exemplars: Sequence[str]) -> str:
         f"Before the first block read the story `{m['story']}`, the block plan `{m['plan']}`, the notation `{m['macros']}`, the genre notes "
         f"`{m['genre']}`, the voice samples under `categorized_exemplars` in `{m['profile']}`{ex}, and the author's red lines `{m['redlines']}`. "
         "Write for a physicist outside the subfield: say why before how, give each result in words before its formula, and keep one story "
-        "running through all blocks. Three bottom lines: (1) state no fact that is not in the material (ledger records, story, lineage); where "
-        "something is missing write \\todo{...}; (2) a theorem, lemma or proposition keeps the hypotheses and quantifiers of its ledger record "
-        "(reformat it freely, never weaken or strengthen it); (3) nothing the red lines forbid. "
-        f"Cite only keys that exist in `{m['bib']}`; otherwise write \\cite{{TODO:short description}}."
+        "running through all blocks. Three bottom lines: (1) state no fact that is not in the material (ledger records, story, literature "
+        "map); where something is missing write \\todo{...}; (2) a theorem, lemma or proposition keeps the hypotheses and quantifiers of its "
+        "ledger record (reformat it freely, never weaken or strengthen it); (3) nothing the red lines forbid. "
+        f"Cite only keys that exist in `{m['bib']}`; otherwise write \\cite{{TODO:short description}}. "
+        f"The literature map `{m['litmap']}` says what each cited work did; metadata and abstracts of verified works are in `{m['bib_cache']}`. "
+        + m.get("decisions_note", "") + m.get("hand_note", "")
+        + "If writing shows that the story or a decision does not hold, write the block as well as you can and raise a concern in your reply. "
+        + CONCERN_RULE
     )
 
 
-def main_block_prompt(b: Dict[str, Any], i: int, n: int, done: Sequence[str], paper_dir: Path, index: Dict[str, Dict[str, Any]]) -> str:
+def _block_task(b: Dict[str, Any], mode: str, why: str, paper_dir: Path) -> str:
+    path = paper_dir / b["file"]
+    if mode == "complete":
+        return f"complete `{path}`: keep its existing text and fill what it marks as missing (\\todo, TODO) or leaves unfinished"
+    if mode == "rewrite":
+        return f"rewrite `{path}` ({why}); keep what still serves the story"
+    return f"write `{path}`"
+
+
+def main_block_prompt(b: Dict[str, Any], i: int, n: int, done: Sequence[str], paper_dir: Path, index: Dict[str, Dict[str, Any]],
+                      mode: str = "write", why: str = "", after: Sequence[str] = ()) -> str:
     done_s = ", ".join(f"`{paper_dir / f}`" for f in done)
     prev = f"Already written (continue the story from where they end): {done_s}" if done else "This is the opening block."
+    nxt = (f"\nAlready written after this block (lead into them; do not edit them): {', '.join(f'`{paper_dir / f}`' for f in after)}"
+           if after else "")
     fig_ids = [str(x) for x in (b.get("figure_ids") or [])]
     figs = f"Figures to place in this block: {', '.join(fig_ids)}.\n" if fig_ids else ""
     return (
-        f"Block {i}/{n} `{b['id']}`: write `{paper_dir / b['file']}` (about {int(b.get('target_words') or 400)} words; end the file with a blank line).\n"
-        f"Its job in the story: {b['purpose']}\n{prev}\n{figs}"
+        f"Block {i}/{n} `{b['id']}`: {_block_task(b, mode, why, paper_dir)} (about {int(b.get('target_words') or 400)} words; end the file "
+        f"with a blank line).\nIts job in the story: {b['purpose']}\n{prev}{nxt}\n{figs}"
         f"Ledger records for this block (exact):\n{ledger_records(index, b.get('claim_ids') or [])}\n"
-        "Write only this block's file. Reply with the file path, a word count and any \\todo items you left."
+        "Write only this block's file. Reply with the file path, a word count, any \\todo items you left and any concerns."
     )
 
 
-def finish_prompt(main_tex: Path, main_files: Sequence[str], paper_dir: Path, genre: str) -> str:
+def finish_prompt(main_tex: Path, main_files: Sequence[str], paper_dir: Path, genre: str, has_abstract: bool = False) -> str:
     """The author's last turn: read the whole main text through, then write the title and the abstract for what is there."""
     limit = ABSTRACT_LIMITS.get(genre)
     lim = f"The venue allows at most {limit} characters including spaces (counted automatically afterwards)." if limit else "Aim for 150 to 220 words."
     files = ", ".join(f"`{paper_dir / f}`" for f in main_files)
+    abstract_task = (
+        f"2. Then check the title and the abstract in `{main_tex}` against the text as it now stands, and write the title and the abstract "
+        "anew only where the text now tells something they do not."
+        if has_abstract else
+        f"2. Then write the title and the abstract in `{main_tex}`, replacing the placeholders, for the text as it now stands."
+    )
     return (
-        f"All main-text blocks are written. 1. Read the whole main text in order ({files}). Smooth the transitions, remove repetition, "
+        f"The main-text blocks are written. 1. Read the whole main text in order ({files}). Smooth the transitions, remove repetition, "
         "and make the introduction promise exactly what the body delivers; keep these edits small and add no new results. "
-        f"2. Then write the title and the abstract in `{main_tex}`, replacing the placeholders, for the text as it now stands. The abstract "
-        "tells the story in miniature: the context and the question, the answer in words, and why it matters. Explain inside the abstract "
-        f"every symbol and acronym it uses, and prefer words to symbols. {lim} "
+        f"{abstract_task} The abstract tells the story in miniature: the context and the question, the answer in words, and why it matters. "
+        f"Explain inside the abstract every symbol and acronym it uses, and prefer words to symbols. {lim} "
         f"Make sure `{main_tex}` inputs `macros.tex` and the block files in this order: {', '.join(main_files)}. "
         "Leave the author list and the acknowledgments placeholders for the human author. Reply with a short list of what you changed."
     )
 
 
-def sm_block_prompt(b: Dict[str, Any], m: Dict[str, str], paper_dir: Path, index: Dict[str, Dict[str, Any]], genre: str) -> str:
+def sm_block_prompt(b: Dict[str, Any], m: Dict[str, str], paper_dir: Path, index: Dict[str, Dict[str, Any]], genre: str,
+                    mode: str = "write", why: str = "") -> str:
     where = "Supplemental Material" if genre == "letter" else "appendix"
     return (
-        f"Write the {where} block `{b['id']}` into `{paper_dir / b['file']}` (about {int(b.get('target_words') or 800)} words; end the file with a blank line).\n"
-        f"Its job: {b['purpose']}\n"
+        f"{where[0].upper() + where[1:]} block `{b['id']}`: {_block_task(b, mode, why, paper_dir)} (about {int(b.get('target_words') or 800)} "
+        f"words; end the file with a blank line).\nIts job: {b['purpose']}\n"
         f"Read the notation `{m['macros']}`, the plan `{m['plan']}` (to see what the main text says) and the red lines `{m['redlines']}`.\n"
         "Rigour first: complete proofs and derivations with every step, and every hypothesis stated. State no fact that is not in the "
         f"material; write \\todo{{...}} where something is missing; cite only keys in `{m['bib']}`, otherwise \\cite{{TODO:short description}}.\n"
-        f"Ledger records for this block (exact):\n{ledger_records(index, b.get('claim_ids') or [])}\n"
-        "Write only this file. Reply with the file path, a word count and any \\todo items you left."
+        + m.get("decisions_note", "") + m.get("hand_note", "")
+        + f"\nLedger records for this block (exact):\n{ledger_records(index, b.get('claim_ids') or [])}\n"
+        "Write only this file. Reply with the file path, a word count, any \\todo items you left and any concerns. " + CONCERN_RULE
     )
 
 
 async def run_draft(paths: Dict[str, Path]) -> Dict[str, Any]:
+    """Write what is missing: empty blocks, the gaps of partial blocks, blocks marked for rewriting (or the files
+    named in `only_files`). Complete blocks are kept and read for continuity."""
     wf = paths["wf"]
     paper_dir = paths["paper"]
     args = _wf_args()
     genre = str(args.get("genre") or "long")
     ledger_path = wf / "00_ground_truth_ledger.json"
+    current_plan(paths, save=True)
     plan = await _ensure_valid_plan(_plan_path(), ledger_path)
     index = _ledger_index(ledger_path)
     refs = stage_refs(paths)
@@ -2034,38 +2799,74 @@ async def run_draft(paths: Dict[str, Path]) -> Dict[str, Any]:
     if sm_blocks and write_skeleton(supp_tex, [b["file"] for b in sm_blocks], genre, title, supplement=True):
         log(f"[draft] wrote the skeleton {supp_tex}")
 
+    rewrite = _load_rewrite(wf)
+    only = only_files(paper_dir)
+
+    def mode_of(b: Dict[str, Any]) -> Optional[str]:
+        status = block_status(paper_dir, b["file"])
+        if only:
+            return ("rewrite" if status == "full" else ("complete" if status == "partial" else "write")) if b["file"] in only else None
+        if b["id"] in rewrite:
+            return "rewrite" if status != "empty" else "write"
+        return {"empty": "write", "partial": "complete"}.get(status)
+
+    modes = {b["id"]: mode_of(b) for b in plan["blocks"]}
+    main_todo = [b for b in main_blocks if modes[b["id"]]]
+    sm_todo = [b for b in sm_blocks if modes[b["id"]]]
+    has_abstract = not abstract_missing(paper_dir)
+    finish = bool(main_todo) or not has_abstract
+    kept = [b["id"] for b in plan["blocks"] if not modes[b["id"]]]
+    if not main_todo and not sm_todo and not finish:
+        log("[draft] every block is complete and nothing is marked for rewriting; nothing to write")
+        return {"skipped": True, "reason": "nothing missing", "kept": kept}
+    if kept:
+        log(f"[draft] keeping {len(kept)} complete block(s): {kept}")
+
     m = {
         "story": str(wf / "01_story.md"), "plan": str(_plan_path()), "macros": str(paper_dir / "macros.tex"),
         "genre": str(refs.get("genre_templates.md", REFS_DIR / "genre_templates.md")), "profile": str(profile_path),
-        "redlines": str(wf / "00_redlines.md"), "bib": str(refs_bib),
+        "redlines": str(wf / "00_redlines.md"), "bib": str(refs_bib), "litmap": str(wf / "01_literature_map.md"),
+        "bib_cache": str(wf / "04_api_bib_cache.json"), "decisions_note": decisions_note(wf), "hand_note": hand_edit_note(wf),
     }
     exemplars = [str(x) for x in (args.get("exemplar_paths") or [])]
 
-    phase("Stage 2: One Author Writes the Main Text Block by Block; SM Blocks in Parallel")
-    author = create_persistent_handle(author_system_prompt(m, exemplars), role="Author", stage_name="draft", tier="builder")
+    phase(f"Draft: {len(main_todo)} main-text block(s) by one author, {len(sm_todo)} SM block(s) in parallel")
     results: Dict[str, List[Any]] = {"main": [], "sm": []}
 
     async def write_main() -> None:
-        done: List[str] = []
-        for i, b in enumerate(main_blocks, 1):
-            results["main"].append(await call_persistent_handle(author, main_block_prompt(b, i, len(main_blocks), done, paper_dir, index), BLOCK_SCHEMA))
-            done.append(b["file"])
-        await call_persistent_handle(author, finish_prompt(main_tex, main_files, paper_dir, genre), {"type": "string"})
+        if not finish:
+            return
+        author = create_persistent_handle(author_system_prompt(m, exemplars), role="Author", stage_name="draft", tier="builder")
+        try:
+            for i, b in enumerate(main_todo, 1):
+                k = main_files.index(b["file"])
+                results["main"].append(await call_persistent_handle(
+                    author, main_block_prompt(b, i, len(main_todo), main_files[:k], paper_dir, index, modes[b["id"]], rewrite.get(b["id"], ""),
+                                              [f for f in main_files[k + 1:] if block_status(paper_dir, f) == "full"]), BLOCK_SCHEMA))
+            await call_persistent_handle(author, finish_prompt(main_tex, main_files, paper_dir, genre, has_abstract), {"type": "string"})
+        finally:
+            author.pop("handle", None)
 
     async def write_sm() -> None:
-        if sm_blocks:
+        if sm_todo:
             bs = max(1, int(_STATE["batch_size"] or 4) - 1)  # the author already uses one slot
             results["sm"] = await run_batched(
-                sm_blocks,
-                lambda b: dispatch_agent(sm_block_prompt(b, m, paper_dir, index, genre), schema=BLOCK_SCHEMA, role=f"SM {b['id']}", stage_name="draft"),
+                sm_todo,
+                lambda b: dispatch_agent(sm_block_prompt(b, m, paper_dir, index, genre, modes[b["id"]], rewrite.get(b["id"], "")),
+                                         schema=BLOCK_SCHEMA, role=f"SM {b['id']}", stage_name="draft"),
                 batch_size=bs,
             )
 
     await _gather_fail_fast([write_main(), write_sm()])
-    author.pop("handle", None)
     snapshot_tex_files(paper_dir, paths["raw_drafts"])
-    todos = [t for r in results["main"] + results["sm"] if isinstance(r, dict) for t in (r.get("todos") or [])]
-    return {"main_blocks": len(main_blocks), "sm_blocks": len(sm_blocks), "main_tex": str(main_tex), "todos": todos}
+    done_ids = {b["id"] for b in main_todo + sm_todo}
+    left = {k: v for k, v in rewrite.items() if k not in done_ids}
+    (wf / "01_rewrite.json").write_text(json.dumps(left, indent=2, ensure_ascii=False), encoding="utf-8")
+    replies = [r for r in results["main"] + results["sm"] if isinstance(r, dict)]
+    todos = [t for r in replies for t in (r.get("todos") or [])]
+    concerns = add_feedback(paths, [c for r in replies for c in (r.get("concerns") or [])], "draft")
+    return {"main_blocks": len(main_todo), "sm_blocks": len(sm_todo), "kept": kept, "main_tex": str(main_tex), "todos": todos,
+            "concerns": len(concerns)}
 
 
 # ------------------------------------------------------------------------------
@@ -2088,7 +2889,12 @@ def _figure_specs(paths: Dict[str, Path]) -> List[Dict[str, Any]]:
     return [f for f in ((bp or {}).get("figures") or []) if isinstance(f, dict)]
 
 
-async def run_figures(paths: Dict[str, Path]) -> Dict[str, Any]:
+def _figure_missing(paths: Dict[str, Path], sp: Dict[str, Any]) -> bool:
+    fid = str(sp.get("id") or "").strip().lower()
+    return not fid or not any(fid in f.stem.lower() for f in paths["figures"].glob("*.pdf"))
+
+
+async def run_figures(paths: Dict[str, Path], only_missing: bool = False) -> Dict[str, Any]:
     paper_dir = paths["paper"]
     fig_dir = paths["figures"]
     fig_scripts = paths["fig_scripts"]
@@ -2104,6 +2910,8 @@ async def run_figures(paths: Dict[str, Path]) -> Dict[str, Any]:
         copy_to_workflow(theme_src, fig_scripts / "journal_fig_theme.py")
 
     specs = _figure_specs(paths)
+    if only_missing:
+        specs = [sp for sp in specs if _figure_missing(paths, sp)]
     if specs:
         await run_batched(
             specs,
@@ -2176,6 +2984,7 @@ ISSUE_SCHEMA = {
                 "properties": {
                     "file": {"type": "string"}, "location": {"type": "string"}, "quote": {"type": "string"}, "problem": {"type": "string"},
                     "evidence": {"type": "string"}, "severity": {"type": "string", "enum": list(SEVERITIES)}, "suggested_fix": {"type": "string"},
+                    "feedback_kind": {"type": "string", "enum": list(FEEDBACK_KINDS)}, "decision_id": {"type": "string"},
                 },
                 "required": ["file", "problem", "severity"],
             },
@@ -2358,6 +3167,321 @@ async def citation_pass(paths: Dict[str, Path], agents: bool = True) -> Optional
     return rep
 
 
+_CITE_CTX_RE = re.compile(r"\\([A-Za-z]*cite[A-Za-z]*)\*?(?:\s*\[[^\]]*\]){0,2}\s*\{([^{}]*)\}")
+
+
+def citation_contexts(paper_dir: Path, audit: Optional[Dict[str, Any]], litmap_text: str, files: Sequence[str]) -> List[Dict[str, Any]]:
+    """Each \\cite with the sentence around it and, per cited key, title, year, authors and abstract (from the citation
+    audit's API metadata) plus what the literature map says the work did. Joined by the program: the checker judges
+    the fit of each citation, it does not look the works up."""
+    meta = {str(e.get("key")): (e.get("api_meta") or {}) for e in (audit or {}).get("entries") or [] if isinstance(e, dict)}
+    notes: Dict[str, str] = {}
+    lm_lines = litmap_text.splitlines()
+    for i, line in enumerate(lm_lines):
+        m = re.search(r"\[verified: ([^\]]+)\]", line)
+        if m:
+            parts = [line.strip().lstrip("-").strip()]
+            for nxt in lm_lines[i + 1:i + 4]:  # a lineage step's "Question / Found / Left open" lines follow it, indented
+                if not re.match(r"\s{2,}- (Question|Found|Left open):", nxt):
+                    break
+                parts.append(nxt.strip().lstrip("-").strip())
+            notes[m.group(1).strip()] = " ".join(parts)
+    out: List[Dict[str, Any]] = []
+    for rel in files:
+        code = _strip_tex_comments(read_text_safe(paper_dir / rel))
+        for m in _CITE_CTX_RE.finditer(code):
+            if m.group(1) == "nocite":
+                continue
+            keys = [k.strip() for k in m.group(2).split(",") if k.strip() and not k.strip().upper().startswith("TODO:")]
+            if not keys:
+                continue
+            s = max(code.rfind(". ", 0, m.start()), code.rfind("\n\n", 0, m.start()))
+            ends = [x for x in (code.find(". ", m.end()), code.find("\n\n", m.end())) if x >= 0]
+            e = min(ends) if ends else len(code)
+            sentence = re.sub(r"\s+", " ", code[(s + 1 if s >= 0 else 0):e + 1]).strip()[:800]
+            works = []
+            for k in keys:
+                md = meta.get(k) or {}
+                authors = md.get("authors") or []
+                works.append({"key": k, "title": str(md.get("title") or ""), "year": str(md.get("year") or ""),
+                              "authors": [str(a) for a in authors[:3]] if isinstance(authors, list) else str(authors),
+                              "arxiv": str(md.get("arxiv") or ""), "abstract": str(md.get("abstract") or "") or "(no abstract available)",
+                              "literature_map": notes.get(k, "")})
+            out.append({"file": rel, "line": code.count("\n", 0, m.start()) + 1, "sentence": sentence, "works": works})
+    return out
+
+
+# ------------------------------------------------------------------------------
+# Citation claims, coarse to fine
+#
+# Every (sentence, cited work) pair is first judged from the work's abstract, its literature-map note and any
+# facts verified earlier from its full text (coarse). Key citations the coarse pass cannot settle are read in
+# full (fine; at effort high, every key citation). Verdicts and per-work reading notes are kept in the citation
+# notes folder (`citation_notes_dir`, default .workflow/citation_notes): an unchanged sentence is not checked
+# again, and a work read once is not read again, here or in a later paper that points to the same folder.
+# ------------------------------------------------------------------------------
+
+CITE_VERDICTS = ("supported", "not_supported", "unclear", "wrong_kind", "timeline")
+_CITE_VERDICT_ITEM = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string"}, "verdict": {"type": "string", "enum": list(CITE_VERDICTS)},
+        "importance": {"type": "string", "enum": ["key", "background"]}, "problem": {"type": "string"},
+        "suggested_fix": {"type": "string"}, "novelty": {"type": "boolean"}, "evidence": {"type": "string"}, "location": {"type": "string"},
+    },
+    "required": ["id", "verdict"],
+}
+CITE_COARSE_SCHEMA = {"type": "object", "properties": {"verdicts": {"type": "array", "items": _CITE_VERDICT_ITEM}}, "required": ["verdicts"]}
+CITE_FINE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdicts": {"type": "array", "items": _CITE_VERDICT_ITEM},
+        "facts": {"type": "array", "items": {"type": "object", "properties": {"statement": {"type": "string"}, "location": {"type": "string"},
+                                                                               "quote": {"type": "string"}}, "required": ["statement", "location"]}},
+    },
+    "required": ["verdicts", "facts"],
+}
+CITE_JUDGE_RULES = (
+    "supported (the work establishes what the sentence credits it with); not_supported (it does not: another result, model or method, "
+    "or less than the sentence claims); wrong_kind (a priority or 'first shown by' statement citing a review, a textbook or a later paper "
+    "instead of the original, or a result credited to a work that only uses it); timeline (a work concurrent with or later than the "
+    "present results cited as earlier work); unclear (the text you have cannot settle it). Set `novelty` when the work contradicts a "
+    "novelty claim of the manuscript ('for the first time', 'new', 'unlike previous work'). Set `importance` to key when the sentence "
+    "relies on the work for a specific result, number, method, priority or novelty comparison, background otherwise."
+)
+
+
+def _notes_dir(wf: Path) -> Path:
+    d = Path(str(_wf_args().get("citation_notes_dir") or (wf / "citation_notes")))
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _safe_key(key: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", key)[:80] or "work"
+
+
+def claim_id(key: str, sentence: str) -> str:
+    return hashlib.sha1((key + "|" + re.sub(r"\s+", " ", sentence).strip().lower()).encode("utf-8")).hexdigest()[:16]
+
+
+def _load_json_file(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(read_text_safe(path) or "null") or default
+    except json.JSONDecodeError:
+        return default
+
+
+def reading_note(nd: Path, key: str) -> Dict[str, Any]:
+    return _load_json_file(nd / f"{_safe_key(key)}.json", {})
+
+
+def needs_fulltext(v: Dict[str, Any]) -> bool:
+    if v.get("level") == "fulltext" or v.get("importance") != "key":
+        return False
+    return v.get("verdict") != "supported" or effort_level() == "high"
+
+
+def fetch_full_text(nd: Path, work: Dict[str, Any]) -> Optional[Path]:
+    """The work's text (pages marked), from `reference_pdfs/<key>.pdf` if given, else from arXiv; cached per work."""
+    txt = nd / f"{_safe_key(work['key'])}.txt"
+    if txt.exists() and txt.stat().st_size > 500:
+        return txt
+    pdf_dir = _wf_args().get("reference_pdfs")
+    cand = Path(str(pdf_dir)) / f"{work['key']}.pdf" if pdf_dir else None
+    if cand is not None and cand.is_file():
+        cli = ["--pdf", str(cand)]
+    elif work.get("arxiv"):
+        cli = ["--arxiv", str(work["arxiv"])]
+    else:
+        return None
+    rc, _, _, _ = run_tool("fetch_fulltext.py", cli + ["--out", str(txt)], allow_fail=True, timeout_s=300)
+    return txt if rc == 0 and txt.exists() else None
+
+
+def _cite_record(pr: Dict[str, Any], v: Dict[str, Any], level: str) -> Dict[str, Any]:
+    verdict = str(v.get("verdict") or "unclear")
+    imp = "key" if pr.get("forced_key") else str(v.get("importance") or "background")
+    return {"id": pr["id"], "claim": pr["claim"], "key": pr["key"], "sentence": pr["sentence"], "file": pr["file"], "line": pr["line"],
+            "verdict": verdict if verdict in CITE_VERDICTS else "unclear", "importance": imp if imp in ("key", "background") else "background",
+            "problem": str(v.get("problem") or ""), "suggested_fix": str(v.get("suggested_fix") or ""), "novelty": bool(v.get("novelty")),
+            "evidence": str(v.get("evidence") or ""), "location": str(v.get("location") or ""), "level": level,
+            "checked": datetime.datetime.now().strftime("%Y-%m-%d")}
+
+
+def coarse_citation_jobs(paths: Dict[str, Path], contexts: Sequence[Dict[str, Any]], role: str = "Citation Check") -> Tuple[List[Tuple[str, Callable[[], Any]]], Dict[str, Any]]:
+    """The coarse pass as jobs for the caller's agent pool; verdicts stored for an unchanged sentence are reused."""
+    wf = paths["wf"]
+    nd = _notes_dir(wf)
+    store = _load_json_file(nd / "verdicts.json", {})
+    pairs: List[Dict[str, Any]] = []
+    for i, c in enumerate(contexts, 1):
+        for w in c.get("works") or []:
+            pairs.append({"id": f"c{i}:{w['key']}", "claim": claim_id(w["key"], c["sentence"]), "key": w["key"], "sentence": c["sentence"],
+                          "file": c.get("file", ""), "line": c.get("line", ""), "work": w, "forced_key": bool(c.get("key_context"))})
+    state: Dict[str, Any] = {"pairs": pairs, "store": store, "nd": nd, "verdicts": {}, "todo": []}
+    for pr in pairs:
+        old = store.get(pr["claim"])
+        if old:
+            state["verdicts"][pr["id"]] = {**old, "id": pr["id"], "file": pr["file"], "line": pr["line"], "reused": True}
+        else:
+            state["todo"].append(pr)
+    batch = int(effort()["cite_context_batch"] or 0)
+    jobs: List[Tuple[str, Callable[[], Any]]] = []
+    if not batch:
+        state["todo"] = []
+        return jobs, state
+    for k in range(0, len(state["todo"]), batch):
+        items = []
+        for pr in state["todo"][k:k + batch]:
+            w = pr["work"]
+            items.append({"id": pr["id"], "file": pr["file"], "line": pr["line"], "sentence": pr["sentence"],
+                          "work": {x: w.get(x) for x in ("key", "title", "year", "authors", "abstract", "literature_map")},
+                          "facts_verified_from_full_text": (reading_note(nd, pr["key"]).get("facts") or [])[:30]})
+        n = k // batch + 1
+        bf = wf / f"04_citation_pairs_{role.split()[0].lower()}_{n}.json"
+        bf.write_text(json.dumps(items, indent=1, ensure_ascii=False), encoding="utf-8")
+        jobs.append((f"cite-coarse:{n}", lambda bf=bf, n=n: dispatch_agent(
+            f"Judge whether each citation fits the sentence that makes it. `{bf}` lists (sentence, cited work) pairs; each work comes with "
+            "its title, year, authors and abstract, what the literature map says it did, and any facts verified earlier from its full text. "
+            "Judge from those only: this is the coarse pass, and key citations you cannot settle are read in full afterwards. For each "
+            f"pair give its `id` and a verdict: {CITE_JUDGE_RULES} For a verdict other than supported say what is wrong in `problem` and, "
+            "if you can, give a `suggested_fix`. Report nothing about style.",
+            schema=CITE_COARSE_SCHEMA, role=f"{role} {n}", stage_name="check", read_only=True, tier="heavy")))
+    return jobs, state
+
+
+async def finish_citation_check(paths: Dict[str, Path], state: Dict[str, Any], coarse_reports: Sequence[Any],
+                                report_name: str = "08_citation_check.md") -> Dict[str, Any]:
+    """Take the coarse verdicts, read the doubtful key works in full, store verdicts and reading notes, write the report."""
+    nd: Path = state["nd"]
+    by_id = {pr["id"]: pr for pr in state["pairs"]}
+    for rep_ in coarse_reports:
+        for v in (rep_.get("verdicts") if isinstance(rep_, dict) else None) or []:
+            pr = by_id.get(str(v.get("id") or ""))
+            if pr is not None and not state["verdicts"].get(pr["id"], {}).get("reused"):
+                state["verdicts"][pr["id"]] = _cite_record(pr, v, "abstract")
+    for pr in state["todo"]:
+        state["verdicts"].setdefault(pr["id"], _cite_record(pr, {"verdict": "unclear", "problem": "no verdict from the coarse pass"}, "abstract"))
+
+    need = [v for v in state["verdicts"].values() if needs_fulltext(v)]
+    rank = {"not_supported": 0, "timeline": 0, "wrong_kind": 1, "unclear": 1, "supported": 2}
+    keys: List[str] = []
+    for v in sorted(need, key=lambda x: rank.get(x["verdict"], 1)):
+        if v["key"] not in keys:
+            keys.append(v["key"])
+    cap = int(effort()["fulltext_works"] or 0)
+    if len(keys) > cap:
+        log(f"[citations] {len(keys)} works would be read in full; reading the first {cap} (effort {effort_level()}), the rest stay at the abstract level")
+        keys = keys[:cap]
+    works = {pr["key"]: pr["work"] for pr in state["pairs"]}
+    texts: Dict[str, Path] = {}
+    unavailable: List[str] = []
+    for k in keys:
+        txt = fetch_full_text(nd, works[k])
+        if txt is None:
+            unavailable.append(k)
+        else:
+            texts[k] = txt
+    for v in need:
+        if v["key"] in unavailable:
+            v["fulltext"] = "unavailable"
+
+    async def fine(k: str) -> Tuple[str, Any]:
+        items = [{"id": v["id"], "sentence": v["sentence"], "coarse_verdict": v["verdict"], "coarse_problem": v["problem"]} for v in need if v["key"] == k]
+        facts = reading_note(nd, k).get("facts") or []
+        w = works[k]
+        res = await dispatch_agent(
+            f"Read the full text of `{k}` ({w.get('title', '')}, {w.get('year', '')}) in `{texts[k]}` (pages are marked `=== page N ===`)."
+            + (f" Facts verified from it earlier: {json.dumps(facts, ensure_ascii=False)}." if facts else "")
+            + f"\nFor each sentence below that cites it, give its `id` and a verdict from the full text: {CITE_JUDGE_RULES} Give the "
+            "`location` (section, equation, theorem or page) and, in `evidence`, a quote of at most 25 words. Then list `facts`: what the "
+            "work establishes that these sentences rely on, each with its location and a short quote, so later citations of it can be "
+            f"checked without reading it again.\nSentences:\n{json.dumps(items, indent=1, ensure_ascii=False)}",
+            schema=CITE_FINE_SCHEMA, role=f"Citation Full Text {k}", stage_name="check", read_only=True, tier="heavy")
+        return k, res
+
+    fine_results = await run_batched([k for k in keys if k in texts], fine) if texts else []
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d")
+    for k, res in fine_results:
+        if not isinstance(res, dict):
+            continue
+        for v in res.get("verdicts") or []:
+            pid = str(v.get("id") or "")
+            old = state["verdicts"].get(pid)
+            if old is not None and old["key"] == k:
+                state["verdicts"][pid] = {**_cite_record(by_id[pid], v, "fulltext"), "importance": old["importance"]}
+        new_facts = [f for f in res.get("facts") or [] if isinstance(f, dict) and f.get("statement")]
+        if new_facts:
+            note = reading_note(nd, k)
+            seen = {(f.get("statement"), f.get("location")) for f in note.get("facts") or []}
+            merged = list(note.get("facts") or []) + [f for f in new_facts if (f.get("statement"), f.get("location")) not in seen]
+            (nd / f"{_safe_key(k)}.json").write_text(json.dumps({
+                "key": k, "title": works[k].get("title", ""), "year": works[k].get("year", ""), "arxiv": works[k].get("arxiv", ""),
+                "text": str(texts[k]), "facts": merged, "updated": stamp}, indent=1, ensure_ascii=False), encoding="utf-8")
+
+    store = state["store"]
+    for v in state["verdicts"].values():
+        store[v["claim"]] = {x: y for x, y in v.items() if x not in ("id", "reused")}
+    (nd / "verdicts.json").write_text(json.dumps(store, indent=1, ensure_ascii=False), encoding="utf-8")
+    verdicts = list(state["verdicts"].values())
+    report = write_citation_report(paths, verdicts, nd, report_name)
+    n_reused = sum(1 for v in verdicts if v.get("reused"))
+    log(f"[citations] {len(verdicts)} citations: {len(verdicts) - n_reused} judged now from abstracts, {n_reused} reused; "
+        f"{len(texts)} works read in full{f', {len(unavailable)} without an accessible full text' if unavailable else ''} -> {report}")
+    return {"verdicts": verdicts, "reused": n_reused, "fulltext_read": sorted(texts), "fulltext_unavailable": unavailable, "report": str(report)}
+
+
+def write_citation_report(paths: Dict[str, Path], verdicts: Sequence[Dict[str, Any]], nd: Path, name: str) -> Path:
+    counts = {k: sum(1 for v in verdicts if v["verdict"] == k) for k in CITE_VERDICTS}
+    md = ["# Citation check (coarse to fine)", "",
+          f"Abstracts first; key citations the abstract could not settle are read in full. Verdicts and reading notes are kept in `{nd}` "
+          "(verdicts.json, one note per work read in full) and reused while a sentence is unchanged.", "",
+          "- " + ", ".join(f"{k}: {n}" for k, n in counts.items()), ""]
+    by_key: Dict[str, List[Dict[str, Any]]] = {}
+    for v in verdicts:
+        by_key.setdefault(v["key"], []).append(v)
+    for key in sorted(by_key):
+        note = reading_note(nd, key)
+        md.append(f"## {key}" + (f" (read in full; {len(note.get('facts') or [])} verified facts in `{_safe_key(key)}.json`)" if note.get("facts") else ""))
+        for v in by_key[key]:
+            tags = [v.get("level", ""), "key" if v.get("importance") == "key" else "", "earlier run" if v.get("reused") else "",
+                    "full text unavailable" if v.get("fulltext") == "unavailable" else ""]
+            line = f"- **{v['verdict']}** ({', '.join(x for x in tags if x)}) {v.get('file', '')}:{v.get('line', '')}: \"{str(v.get('sentence', ''))[:220]}\""
+            if v.get("location"):
+                line += f" [at {v['location']}]"
+            if v.get("problem"):
+                line += f" {v['problem']}"
+            if v.get("evidence"):
+                line += f" Evidence: {v['evidence']}"
+            md.append(line)
+        md.append("")
+    path = paths["audit"] / name
+    path.write_text("\n".join(md), encoding="utf-8")
+    return path
+
+
+def issues_from_citation_verdicts(verdicts: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for v in verdicts:
+        sev = {"not_supported": "high", "timeline": "high", "wrong_kind": "medium"}.get(v["verdict"])
+        if sev:
+            problem = f"citation {v['key']}: {v['verdict'].replace('_', ' ')}" + (f": {v['problem']}" if v.get("problem") else "")
+        elif v["verdict"] == "unclear" and v.get("importance") == "key":
+            sev = "low"
+            why = "its full text was not accessible" if v.get("fulltext") == "unavailable" else f"checked at the {v.get('level', 'abstract')} level"
+            problem = f"could not confirm that {v['key']} supports this sentence ({why}; a PDF named {v['key']}.pdf in reference_pdfs allows a full reading)"
+        else:
+            continue
+        it = {"file": v.get("file", ""), "location": str(v.get("line", "")), "quote": str(v.get("sentence", ""))[:300], "problem": problem,
+              "severity": sev, "evidence": "; ".join(x for x in (v.get("location", ""), v.get("evidence", "")) if x),
+              "suggested_fix": v.get("suggested_fix", ""), "kind": "citation", "source": f"citation-check ({v.get('level', 'abstract')})"}
+        if v.get("novelty"):
+            it["feedback_kind"] = "literature"
+        out.append(it)
+    return out
+
+
 def _scripted_check_guarded(prompt: str, role: str) -> Any:
     """A checker that may write scripts (under .workflow/verify_scripts) but must not change the manuscript."""
     async def _go() -> Any:
@@ -2388,9 +3512,10 @@ def _pick_numeric_claims(ledger_path: Path, plan: Optional[Dict[str, Any]], limi
     return [by_id[c] for c in order[:limit]]
 
 
-def check_groups(paper_dir: Path, budget: int = CHECK_GROUP_BYTES) -> List[Tuple[str, List[str]]]:
+def check_groups(paper_dir: Path, budget: Optional[int] = None) -> List[Tuple[str, List[str]]]:
     """The main text is one group, read in order by one checker (a story is checked as a whole, and an issue is
     pinned to the right file). Every other .tex file is packed, in reading order, into groups of about `budget` bytes."""
+    budget = int(budget or effort()["check_group_bytes"] or CHECK_GROUP_BYTES)
     main = part_files(paper_dir, "main.tex")
     groups: List[Tuple[str, List[str]]] = [("main text", main)] if main else []
     supp = resolve_supplement_path(paper_dir)
@@ -2455,7 +3580,8 @@ async def run_check(paths: Dict[str, Path], llm: bool = True) -> Dict[str, Any]:
         defs_cli += ["--abstract-max-chars", str(ABSTRACT_LIMITS[genre])]
     _, _, _, defs = run_tool("audit_tex_defs.py", defs_cli, allow_fail=True)
     issues: List[Dict[str, Any]] = issues_from_defs(paper_dir, defs)
-    issues += issues_from_citations(paper_dir, await citation_pass(paths, agents=llm))
+    cite_rep = await citation_pass(paths, agents=llm)
+    issues += issues_from_citations(paper_dir, cite_rep)
     tex_files = list_editable_tex(paper_dir)
     _, _, _, wm = run_tool("clean_watermarks.py", ["--paths", str(paper_dir), "--json-out", str(wf / "05_clean_wm.json")], allow_fail=True)
     sty = None
@@ -2471,8 +3597,13 @@ async def run_check(paths: Dict[str, Path], llm: bool = True) -> Dict[str, Any]:
         log(f"Deterministic check after revise: {len(issues)} issues (high {counts['high']}) -> {report}")
         return {"issues": len(issues), **counts, "issues_json": str(issues_path), "report": str(report)}
 
-    truth = (f"the ledger `{ledger_path}` and the original notes and authority files {auth_files}. Do not use `01_story.md`, `01_plan.json` "
-             f"or the old `01_blueprint.json` as evidence")
+    if auth_files:
+        truth = (f"the ledger `{ledger_path}` and the original notes and authority files {auth_files}. Do not use `01_story.md`, `01_plan.json` "
+                 f"or the old `01_blueprint.json` as evidence")
+    else:
+        truth = (f"the ledger `{ledger_path}`, which was built from the paper itself because no notes were given: check the mathematics and the "
+                 f"internal consistency (a result stated differently in two places is an issue). Do not use `01_story.md`, `01_plan.json` or the "
+                 f"old `01_blueprint.json` as evidence")
     scope_rules = (
         f"Report every place where the text (a) states a result with a wider scope, or weaker or stronger hypotheses or quantifiers, than "
         f"the source; (b) attributes something to the wrong work or misdescribes a cited work (metadata and abstracts of cited works: "
@@ -2481,16 +3612,45 @@ async def run_check(paths: Dict[str, Path], llm: bool = True) -> Dict[str, Any]:
         f"told in words with its technical hypotheses left to the body: report only what is false or stronger than the source there, "
         f"not a missing qualifier."
     )
+    concern_txt = (
+        decisions_note(wf) + hand_edit_note(wf)
+        + "If an issue cannot be fixed by a local edit because the story, the structure, a headline or one of the author's decisions would "
+        "have to change, or if it shows that a decision rests on something that does not hold, give it `feedback_kind` (evidence, "
+        "literature, feasibility or conflict) and the `decision_id` if one applies: the author decides those."
+    )
+    only = only_files(paper_dir)
+    report_only = f" Report issues only in: {', '.join(only)}." if only else ""
+    intro = next((b["file"] for b in (plan or {}).get("blocks", []) if b.get("part") == "main"), None)
+    intro_txt = f" and the introduction `{paper_dir / intro}`" if intro else " and its introduction (the first main-text section it inputs)"
+    math_txt = f" The abstract uses these math expressions: {json.dumps((defs or {}).get('abstract_math') or [], ensure_ascii=False)}." if (defs or {}).get("abstract_math") else ""
+    reader_task = (
+        f"Read the abstract in `{main_tex}`{intro_txt} as a physicist from a neighbouring field would.{math_txt}\n"
+        f"Report: (1) every sentence of the abstract or the introduction that is false or claims more than the results support (compare "
+        f"with the ledger `{ledger_path}`), severity high. These parts tell results in words and leave technical hypotheses (system size, "
+        f"boundary conditions, parameter ranges) to the body; a missing qualifier is not an issue unless the sentence is false without it. "
+        f"(2) every symbol or acronym in the abstract that the abstract itself does not explain, severity medium; (3) one issue for each of "
+        f"these questions the introduction leaves unanswered, severity medium: what is the question, why does it matter, how far did "
+        f"earlier work get, what is new here."
+    )
+    want_reader = not only or "main.tex" in only or (intro is not None and intro in only)
+    separate_reader = bool(effort()["separate_reader"])
+
     jobs: List[Tuple[str, Callable[[], Any]]] = []
     for label, files in check_groups(paper_dir):
+        if only and not any(f in only for f in files):
+            continue
         listing = ", ".join(f"`{paper_dir / f}`" for f in files)
-        jobs.append((f"scope:{label}", lambda label=label, files=files, listing=listing: dispatch_agent(
+        second = f"\nThen, as a second pass: {reader_task}" if (label == "main text" and want_reader and not separate_reader) else ""
+        jobs.append((f"scope:{label}", lambda label=label, files=files, listing=listing, second=second: dispatch_agent(
             f"Check the {label} of the manuscript in `{paper_dir}`: read {listing} in this order, as one text, against {truth}.\n{scope_rules}\n"
-            f"Give each issue the file it is in (one of: {', '.join(files)}).\n{ISSUE_FORMAT}",
+            f"{concern_txt}{report_only}{second}\nGive each issue the file it is in (one of: {', '.join(files)}).\n{ISSUE_FORMAT}",
             schema=ISSUE_SCHEMA, role=f"Check {label}", stage_name="check", read_only=True, tier="heavy")))
 
-    max_checks = args.get("max_numeric_checks")
-    for c in _pick_numeric_claims(ledger_path, plan, DEFAULT_NUMERIC_CHECKS if max_checks is None else int(max_checks)):  # 0 = none
+    picks = _pick_numeric_claims(ledger_path, plan, int(effort_setting("max_numeric_checks")))  # 0 = none
+    if only and plan:
+        only_ids = {str(c) for b in plan.get("blocks", []) if b.get("file") in only for c in (b.get("claim_ids") or [])}
+        picks = [c for c in picks if str(c.get("id")) in only_ids]
+    for c in picks:
         jobs.append((f"numeric:{c.get('id', '?')}", lambda c=c: _scripted_check_guarded(
             f"Independently check this ledger result as the manuscript in `{paper_dir}` states it:\n{json.dumps(c, ensure_ascii=False)}\n"
             f"Write and run a standalone script with `{resolve_python_exe()}` in `{paths['verify_scripts']}` that tests the identity or number "
@@ -2498,28 +3658,43 @@ async def run_check(paths: Dict[str, Path], llm: bool = True) -> Dict[str, Any]:
             f"and cite the script as evidence.\n{ISSUE_FORMAT}",
             f"Numeric {c.get('id', '?')}")))
 
-    intro = next((b["file"] for b in (plan or {}).get("blocks", []) if b.get("part") == "main"), None)
-    intro_txt = f" and the introduction `{paper_dir / intro}`" if intro else " and its introduction (the first main-text section it inputs)"
-    math_txt = f" The abstract uses these math expressions: {json.dumps((defs or {}).get('abstract_math') or [], ensure_ascii=False)}." if (defs or {}).get("abstract_math") else ""
-    jobs.append(("reader", lambda: dispatch_agent(
-        f"Read the abstract in `{main_tex}`{intro_txt} as a physicist from a neighbouring field would.{math_txt}\n"
-        f"Report: (1) every sentence of the abstract or the introduction that is false or claims more than the results support (compare "
-        f"with the ledger `{ledger_path}`), severity high. These parts tell results in words and leave technical hypotheses (system size, "
-        f"boundary conditions, parameter ranges) to the body; a missing qualifier is not an issue unless the sentence is false without it. "
-        f"(2) every symbol or acronym in the abstract that the abstract itself does not explain, severity medium; (3) one issue for each of "
-        f"these questions the introduction leaves unanswered, severity medium: what is the question, why does it matter, how far did "
-        f"earlier work get, what is new here.\n{ISSUE_FORMAT}",
-        schema=ISSUE_SCHEMA, role="Reader Check", stage_name="check", read_only=True, tier="heavy")))
+    cite_state: Optional[Dict[str, Any]] = None
+    if effort()["cite_context_batch"] and cite_rep:
+        ctx_files = [str(f.relative_to(paper_dir)).replace("\\", "/") for f in list_editable_tex(paper_dir)]
+        ctx = citation_contexts(paper_dir, cite_rep, read_text_safe(wf / "01_literature_map.md"),
+                                [f for f in ctx_files if not only or f in only])
+        cite_jobs, cite_state = coarse_citation_jobs(paths, ctx)
+        jobs += cite_jobs
+        log(f"[check] citations: {len(cite_state['pairs'])} (sentence, work) pairs, {len(cite_state['pairs']) - len(cite_state['todo'])} "
+            f"settled in an earlier run, {len(cite_jobs)} coarse checker(s)")
+    elif effort()["cite_context_batch"]:
+        log("[check] no citation audit report (offline?): the citation check is skipped")
+
+    if want_reader and separate_reader:
+        jobs.append(("reader", lambda: dispatch_agent(
+            f"{reader_task}\n{concern_txt}\n{ISSUE_FORMAT}",
+            schema=ISSUE_SCHEMA, role="Reader Check", stage_name="check", read_only=True, tier="heavy")))
 
     # One pool for every checker: the wall clock is ceil(jobs / max_parallel) rounds, not one round set per kind of check.
     reports = await run_batched(jobs, lambda job: job[1]())
     for (source, _), rep in zip(jobs, reports):
-        issues += collect_issues(paper_dir, [rep], source)
+        if not source.startswith("cite-coarse:"):
+            issues += collect_issues(paper_dir, [rep], source)
+    cite_out: Optional[Dict[str, Any]] = None
+    if cite_state is not None:
+        cite_out = await finish_citation_check(paths, cite_state, [r for (s, _), r in zip(jobs, reports) if s.startswith("cite-coarse:")])
+        issues += issues_from_citation_verdicts(cite_out["verdicts"])
+    if only:
+        issues = [i for i in issues if not i.get("file") or i.get("file") in only]
 
     issues = dedupe_issues(issues)
+    concerns, issues = concerns_from_issues(issues)
+    filed = add_feedback(paths, concerns, "check")
     issues_path, report, counts = _write_check_report(paths, issues, "", "Check Report", "Nothing was rewritten here; `mode=revise` hands these issues to the author.")
-    log(f"Check: {len(issues)} issues (high {counts['high']}, medium {counts['medium']}, low {counts['low']}) from {len(jobs)} checkers -> {report}")
-    return {"issues": len(issues), **counts, "checkers": len(jobs), "issues_json": str(issues_path), "report": str(report)}
+    log(f"Check: {len(issues)} issues (high {counts['high']}, medium {counts['medium']}, low {counts['low']}) from {len(jobs)} checkers"
+        f"{f'; {len(filed)} concern(s) for the author' if filed else ''} -> {report}")
+    return {"issues": len(issues), **counts, "checkers": len(jobs), "concerns": len(filed), "issues_json": str(issues_path), "report": str(report),
+            "citations": {k: cite_out[k] for k in ("reused", "fulltext_read", "fulltext_unavailable", "report")} if cite_out else None}
 
 
 # ------------------------------------------------------------------------------
@@ -2531,7 +3706,8 @@ REVISE_SCHEMA = {
     "type": "object",
     "properties": {
         "fixed": {"type": "array", "items": {"type": "string"}},
-        "declined": {"type": "array", "items": {"type": "object", "properties": {"issue": {"type": "string"}, "reason": {"type": "string"}}, "required": ["issue", "reason"]}},
+        "declined": {"type": "array", "items": {"type": "object", "properties": {"issue": {"type": "string"}, "reason": {"type": "string"},
+                                                                                "decision_id": {"type": "string"}}, "required": ["issue", "reason"]}},
     },
     "required": ["fixed", "declined"],
 }
@@ -2608,10 +3784,11 @@ def _revise_rules(paper_dir: Path, genre: str, story_path: Path, inst_path: Opti
         "introduction, fix an overclaim by rewording the sentence or dropping the claim, never by adding qualifiers or hypotheses: those "
         "belong in the theorem statement or the Supplemental Material"
         + (f", and the abstract must stay within {limit} characters including spaces. " if limit else ". ")
-        + "If an issue is mistaken, or its text is not where it says, leave the text and say why. "
+        + "If an issue is mistaken, or its text is not where it says, leave the text and say why. If fixing it would go against one of "
+        "the author's decisions, do not fix it: decline it and give the `decision_id`. "
         f"Keep the macros in `{paper_dir / 'macros.tex'}`."
     )
-    return story + inst, rules
+    return story + inst + decisions_note(story_path.parent) + hand_edit_note(story_path.parent), rules
 
 
 def _revise_file_prompt(paper_dir: Path, rel: str, items: List[Dict[str, Any]], context: str, rules: str) -> str:
@@ -2694,7 +3871,7 @@ async def run_revise(paths: Dict[str, Path], build_after: bool = True, prefer_re
             if rel:
                 by_file.setdefault(rel, []).append(it)
         source = str(issues_path)
-        if not args.get("revise_low"):
+        if not effort_setting("revise_low"):
             # A file whose issues are all low severity (copy-edit and flow hints) is not worth an agent call by default.
             skipped_low = sorted(r for r, items in by_file.items() if all(str(i.get("severity") or "medium") == "low" for i in items))
             for r in skipped_low:
@@ -2756,6 +3933,9 @@ async def run_revise(paths: Dict[str, Path], build_after: bool = True, prefer_re
                     continue
                 by_file.setdefault(rel, []).append({"issues_to_fix": str(it.get("issues_to_fix", "")), "instruction_refs": str(it.get("instruction_refs", ""))})
 
+    only = only_files(paper_dir)
+    if only:
+        by_file = {k: v for k, v in by_file.items() if k in only}
     story_path = wf / "01_story.md"
     context, rules = _revise_rules(paper_dir, genre, story_path, inst_path, inst_len)
     main_order = main_part_files(paper_dir)
@@ -2804,6 +3984,12 @@ async def run_revise(paths: Dict[str, Path], build_after: bool = True, prefer_re
         lines += ["## Math changed (review it)", ""] + [f"- {rel}: {v}" for rel, v in math_changes.items()] + [""]
     report = audit_dir / "06_revise_report.md"
     report.write_text("\n".join(lines), encoding="utf-8")
+    conflicts = [{"kind": "conflict", "blocking": False, "finding": f"not fixed because it goes against a decision: {d.get('issue', '')}",
+                  "evidence": str(d.get("reason") or ""), "decision_id": str(d.get("decision_id") or ""),
+                  "options": ["keep the decision and the text", "change the decision so the issue can be fixed"]}
+                 for r in results.values() if isinstance(r, dict) for d in (r.get("declined") or [])
+                 if isinstance(d, dict) and str(d.get("decision_id") or "").strip()]
+    add_feedback(paths, conflicts, "revise")
     out: Dict[str, Any] = {"checkpoint": str(snap_dir), "instructions": source, "planner_skipped": skip_plan,
                            "revised_files": main_targets + others, "skipped_low": skipped_low, "agent_calls": len(others) + (1 if main_targets else 0),
                            "declined": declined_total, "math_changed_files": sorted(math_changes), "report": str(report)}
@@ -3032,36 +4218,161 @@ async def run_smoke_test(paths: Dict[str, Path]) -> Dict[str, Any]:
     return {"runtime": _STATE["runtime"], "python_exe": py_exe, "tools_ok": tool_checks, "pings": pings}
 
 
-def _pause_after_story() -> bool:
+def _pause_enabled() -> bool:
+    """`pause_after_story` (default true): stop for the author at the briefing, the story confirmation and blocking
+    concerns. False = an unattended run (the agent chooses the story; concerns wait in the list)."""
     v = _wf_args().get("pause_after_story")
     return True if v is None else bool(v)
 
 
-async def _check_revise_build(paths: Dict[str, Path]) -> Dict[str, Any]:
-    """One full check of the finished text, one revision by the author, then programs only (no second LLM check:
-    it mostly re-found what the author had declined with reasons). Run mode=check again by hand if wanted."""
-    first = await run_check(paths)
-    if not first.get("issues"):
-        return {"check": first, "revise": {"skipped": True, "reason": "no issues"}, "build": await run_build(paths)}
-    rv = await run_revise(paths, build_after=False)
-    after = await run_check(paths, llm=False)
-    return {"check": first, "revise": rv, "after_revise": after, "build": await run_build(paths)}
+def _paused(out: Dict[str, Any], kind: str, paths: Dict[str, Path]) -> Dict[str, Any]:
+    wf = paths["wf"]
+    if kind == "discuss":
+        msg = (
+            f"Briefing ready: {wf / '01_briefing.md'} (literature map: {wf / '01_literature_map.md'}). Talk it through with the author in "
+            "this order: (1) give the core information of the briefing (results with their evidence, literature, limits, open questions) "
+            "without proposing a storyline or recommending anything; (2) ask for the author's idea and let them speak first; (3) only then "
+            "give your own view (what supports or weakens their idea, what history the introduction would need, likely referee objections, "
+            f"alternatives you see); (4) discuss until you agree. Write the agreed points, including what was decided against and why, to "
+            f"{wf / '01_discussion.md'}, then run mode=auto again."
+        )
+    elif kind == "confirm":
+        msg = (
+            f"Story, block plan and decision record written from the discussion: {wf / '01_story.md'}, {_plan_path()}, "
+            f"{wf / '01_decisions.json'}. Show the author the story, including the choices under 'Filled in by the AI'. When the author "
+            "confirms (or has edited these files), run mode=auto again: the story is locked and writing starts."
+        )
+    else:
+        blk = open_blocking(load_feedback(wf))
+        top = "\n".join(f"- {i['id']} [{i.get('kind', '')}]: {i.get('finding', '')}" for i in blk[:MAX_BLOCKING_SHOWN])
+        more = f"\n(and {len(blk) - MAX_BLOCKING_SHOWN} more)" if len(blk) > MAX_BLOCKING_SHOWN else ""
+        msg = (
+            f"{len(blk)} concern(s) need the author's answer before the run goes on:\n{top}{more}\nFull list: "
+            f"{paths['audit'] / '07_feedback.md'}. For each, tell the author the finding, the evidence, the decision it touches and what "
+            "that decision rested on, the options and the recommendation. Record each answer in "
+            f"{_feedback_path(wf)} (`answer`, `status`: \"answered\", and `keep`: true when the author keeps the decision), then run mode=auto again."
+        )
+    log(msg)
+    return {**out, "paused": kind, "next": msg}
 
 
-async def execute_mode() -> Dict[str, Any]:
-    args = _wf_args()
-    raw = str(args.get("mode") or "smoke_test")
-    mode = MODE_ALIASES.get(raw, raw)
-    if mode != raw:
-        log(f"[mode] '{raw}' is called '{mode}' since v3")
-    paper_dir = Path(str(args["paper_dir"]))
-    paths = ensure_dirs(paper_dir)
-    preflight_permissions(paper_dir)
+def _gate(paths: Dict[str, Path], out: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if _pause_enabled() and open_blocking(load_feedback(paths["wf"])):
+        return _paused(out, "concerns", paths)
+    return None
 
-    if mode == "smoke_test":
-        return await run_smoke_test(paths)
+
+def _story_needed(paths: Dict[str, Path]) -> bool:
+    """Text is missing (not merely marked for rewriting): only then does an unlocked paper go through the story."""
+    paper_dir = paths["paper"]
+    blocks = (current_plan(paths) or {}).get("blocks", [])
+    return not blocks or any(block_status(paper_dir, b["file"]) != "full" for b in blocks) or abstract_missing(paper_dir)
+
+
+def _writing_needed(paths: Dict[str, Path]) -> bool:
+    paper_dir = paths["paper"]
+    blocks = (current_plan(paths) or {}).get("blocks", [])
+    return (not blocks or any(block_status(paper_dir, b["file"]) != "full" for b in blocks)
+            or bool(_load_rewrite(paths["wf"])) or abstract_missing(paper_dir) or bool(only_files(paper_dir)))
+
+
+async def run_auto(paths: Dict[str, Path], start: str = "") -> Dict[str, Any]:
+    """Run what the paper still needs, from wherever it stands. Stops for the author at the briefing, at the story
+    confirmation and at blocking concerns (unless pause_after_story=false)."""
+    wf, paper_dir = paths["wf"], paths["paper"]
+    start = start or str(_wf_args().get("start") or "")
+    if start not in AUTO_STARTS:
+        raise ValueError(f"start must be one of {AUTO_STARTS[1:]}, not {start!r}")
+    pause = _pause_enabled()
+    st = run_survey(paths)
+    out: Dict[str, Any] = {"effort": effort_level(), "survey": {"next": st["next"], "hand_edits": st["hand_edits"],
+                                                               "blocks": {b["id"]: b["status"] for b in st["blocks"]}}}
+    log(f"[survey] effort={out['effort']}; next: {st['next']} (details: {paths['audit'] / '00_survey.md'})")
+    if st["concerns"]["answered"]:
+        out["answers"] = await apply_feedback(paths)
+    gate = _gate(paths, out)
+    if gate:
+        return gate
+
+    late = start in ("check", "revise", "build")
+    if not late or not (wf / "00_ground_truth_ledger.json").exists():
+        out["inventory"] = await run_inventory(paths)
+
+    # The story: briefing -> the author's discussion -> story, plan and decisions -> the author confirms -> lock.
+    story_p, brief_p, disc_p = wf / "01_story.md", wf / "01_briefing.md", wf / "01_discussion.md"
+    if start == "brief" and (wf / "01_lock.json").exists():
+        (wf / "01_lock.json").unlink()
+    if not late and start != "draft" and (start in ("brief", "story") or (not lock_valid(wf) and _story_needed(paths))):
+        if start == "brief" or (not story_p.exists() and not brief_p.exists()):
+            out["brief"] = await run_brief(paths, out.get("inventory"))
+            if pause:
+                return _paused(out, "discuss", paths)
+        if not story_p.exists() or start in ("brief", "story") or (disc_p.exists() and disc_p.stat().st_mtime > story_p.stat().st_mtime):
+            if pause and not disc_p.exists() and not story_p.exists():
+                return _paused(out, "discuss", paths)
+            out["story"] = await run_story(paths, out.get("inventory"))
+            if pause:
+                return _paused(out, "confirm", paths)
+        out["lock"] = await lock_story(paths)
+
+    # Writing: only what is missing, partial or marked for rewriting.
+    if not late and (start == "draft" or _writing_needed(paths)):
+        out["draft"] = await run_draft(paths)
+        gate = _gate(paths, out)
+        if gate:
+            return gate
+        specs = _figure_specs(paths) if _wants_figures(paths) else []
+        if any(_figure_missing(paths, sp) for sp in specs):
+            out["figures"] = await run_figures(paths, only_missing=True)
+
+    # Check, revise, build: once per change of the text.
+    if start == "build":
+        out["build"] = await run_build(paths)
+    elif start == "revise":
+        out["revise"] = await run_revise(paths, build_after=False)
+        gate = _gate(paths, out)
+        if gate:
+            return gate
+        out["after_revise"] = await run_check(paths, llm=False)
+        out["build"] = await run_build(paths)
+    elif start == "check" or not run_survey(paths)["checked_since_last_change"]:
+        out["check"] = await run_check(paths)
+        gate = _gate(paths, out)
+        if gate:
+            return gate
+        if out["check"].get("issues"):
+            out["revise"] = await run_revise(paths, build_after=False)
+            gate = _gate(paths, out)
+            if gate:
+                return gate
+            out["after_revise"] = await run_check(paths, llm=False)
+        out["build"] = await run_build(paths)
+    else:
+        out["check"] = {"skipped": True, "reason": "the text has not changed since the last check"}
+    if "build" in out:
+        (wf / "06_checked_hashes.json").write_text(json.dumps(text_hashes(paper_dir), indent=1), encoding="utf-8")
+        if effort()["referee"]:
+            out["blind_referee"] = await run_blind_referee(paths)
+
+    open_items = [i for i in load_feedback(wf)["items"] if i.get("status") == "open"]
+    out["concerns_open"] = len(open_items)
+    out["next"] = (
+        f"{len(open_items)} concern(s) wait for the author: {paths['audit'] / '07_feedback.md'}. Answer them in {_feedback_path(wf)} and "
+        "run mode=auto again." if open_items else
+        "Done." + ("" if effort()["referee"] else " Optional: mode=blind_referee for an isolated referee panel, then mode=revise with its report.")
+    )
+    return out
+
+
+async def _run_mode(mode: str, raw: str, paths: Dict[str, Path]) -> Dict[str, Any]:
+    if mode == "auto" or mode in PIPELINE_STARTS:
+        return await run_auto(paths, PIPELINE_STARTS.get(mode, ""))
+    if mode == "survey":
+        return run_survey(paths)
     if mode == "inventory":
         return await run_inventory(paths)
+    if mode == "brief":
+        return await run_brief(paths)
     if mode == "story":
         return await run_story(paths)
     if mode == "draft":
@@ -3078,24 +4389,27 @@ async def execute_mode() -> Dict[str, Any]:
         return await run_build(paths)
     if mode == "blind_referee":
         return await run_blind_referee(paths)
-    if mode == "check_and_revise":
-        return await _check_revise_build(paths)
-    if mode in ("draft_and_check", "full_auto"):
-        out: Dict[str, Any] = {}
-        if mode == "full_auto":
-            out["inventory"] = await run_inventory(paths)
-            out["story"] = await run_story(paths, out["inventory"])
-            if _pause_after_story():
-                msg = (f"Paused for the author: read {paths['wf'] / '01_story.md'} (edit it and 01_plan.json if needed), "
-                       f"then run mode=draft_and_check. Set pause_after_story=false to run straight through.")
-                log(msg)
-                return {**out, "paused": True, "next": msg}
-        out["draft"] = await run_draft(paths)
-        out["figures"] = await run_figures(paths) if _wants_figures(paths) else {"skipped": True, "reason": "no figure specs, scripts, or plan figures"}
-        out.update(await _check_revise_build(paths))
-        out["next"] = "Optional: mode=blind_referee for an isolated referee panel, then mode=revise with its report."
-        return out
     raise ValueError(f"Unsupported mode: {raw}")
+
+
+async def execute_mode() -> Dict[str, Any]:
+    args = _wf_args()
+    raw = str(args.get("mode") or "smoke_test")
+    mode = MODE_ALIASES.get(raw, raw)
+    if mode != raw:
+        log(f"[mode] '{raw}' is called '{mode}' since v4" if raw == "full_auto" else f"[mode] '{raw}' is called '{mode}' since v3")
+    paper_dir = Path(str(args["paper_dir"]))
+    paths = ensure_dirs(paper_dir)
+    preflight_permissions(paper_dir)
+    if mode == "smoke_test":
+        return await run_smoke_test(paths)
+    detect_hand_edits(paths)
+    before = text_hashes(paper_dir)
+    try:
+        return await _run_mode(mode, raw, paths)
+    finally:
+        # What the workflow changed in this run (also in a run that stopped) is its own text, not a hand edit.
+        remember_text(paths, before)
 
 
 async def run_from_antigravity(host_globals: Dict[str, Any]) -> Dict[str, Any]:
@@ -3112,7 +4426,7 @@ async def run_from_antigravity(host_globals: Dict[str, Any]) -> Dict[str, Any]:
         "check_backend": str(wf_args.get("check_backend") or ""),
         "wf_args": wf_args,
         "models_cfg": dict(wf_args.get("models") or {}),
-        "batch_size": max(1, min(8, int(wf_args.get("max_parallel") or 4))),
+        "batch_size": initial_batch_size(wf_args),
         "inherit_deadlock": False,
         "ag_agent": host_globals.get("agent"),
         "ag_parallel": host_globals.get("parallel"),
@@ -3196,7 +4510,7 @@ async def run_from_cli(
         "check_backend": check_backend or str(args_dict.get("check_backend") or ""),
         "wf_args": dict(args_dict),
         "models_cfg": dict(args_dict.get("models") or {}),
-        "batch_size": max(1, min(8, int(args_dict.get("max_parallel") or 4))),
+        "batch_size": initial_batch_size(args_dict),
         "inherit_deadlock": False,
         "skip_agent_pings": skip_agent_pings,
         "agent_timeout": int(args_dict.get("agent_timeout_s") or 1800),

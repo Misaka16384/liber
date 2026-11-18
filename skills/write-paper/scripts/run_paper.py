@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Standalone multi-agent CLI entrypoint for /write-paper (v3).
+"""Standalone multi-agent CLI entrypoint for /write-paper (v4).
 
-Runs the full pipeline or any single phase from Claude Code, OpenAI Codex CLI, Antigravity CLI (`agy`),
-or a standard terminal:
+Runs what a paper still needs (`auto`), or any single stage, from Claude Code, OpenAI Codex CLI,
+Antigravity CLI (`agy`), or a standard terminal:
 
-  python run_paper.py --mode full_auto --paper-dir ./paper --source-paths ./notes --genre letter
-  python run_paper.py --mode draft_and_check --paper-dir ./paper --backend agy --check-backend claude
+  python run_paper.py --mode auto --paper-dir ./paper --source-paths ./notes --genre letter
+  python run_paper.py --mode auto --paper-dir ./paper --from check --effort low
+  python run_paper.py --mode survey --paper-dir ./paper
 """
 
 from __future__ import annotations
@@ -26,7 +27,10 @@ import workflow_engine  # noqa: E402
 
 
 MODES = [
+    "auto",
+    "survey",
     "inventory",
+    "brief",
     "story",
     "draft",
     "figures",
@@ -50,12 +54,18 @@ MODES = [
 ]
 
 ALL_STAGES = ["inventory", "story", "draft", "figures", "check", "revise", "compile_fix", "blind_referee"]
+STARTS = ["brief", "story", "draft", "check", "revise", "build"]
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Standalone CLI runner for /write-paper v3 across Claude Code, Codex, and Antigravity.")
+    ap = argparse.ArgumentParser(description="Standalone CLI runner for /write-paper v4 across Claude Code, Codex, and Antigravity.")
     ap.add_argument("--args-json", type=Path, help="Optional JSON file matching workflow.json schema; CLI flags override its values.")
-    ap.add_argument("--mode", choices=MODES, help="On-demand modular phase or composite pipeline.")
+    ap.add_argument("--mode", choices=MODES, help="auto (what the paper still needs), survey (where it stands), or a single stage.")
+    ap.add_argument("--effort", choices=["low", "medium", "high"], default=None, help="How much checking and literature work a run does (default medium); sets the default --max-parallel, numeric checks and revise depth.")
+    ap.add_argument("--from", dest="start", choices=STARTS, default=None, help="auto: start at this stage and run to the end (brief reopens the story; check skips writing).")
+    ap.add_argument("--only", dest="only_files", nargs="*", help="Limit draft, check and revise to these files (relative to the paper directory).")
+    ap.add_argument("--reference-pdfs", type=str, help="Folder of PDFs named <bibkey>.pdf: the citation check reads these in full when an abstract is not enough (otherwise it uses arXiv).")
+    ap.add_argument("--citation-notes-dir", type=str, help="Where citation verdicts and per-work reading notes are kept (default <paper-dir>/.workflow/citation_notes); share one folder across papers to reuse them.")
     ap.add_argument("--paper-dir", type=Path, help="Target LaTeX paper project root directory.")
     ap.add_argument("--source-paths", nargs="*", help="Core derivation notes, reports, verification scripts, and data directories.")
     ap.add_argument("--authority-paths", nargs="*", help="Highest-authority scope, redline, and benchmark documents.")
@@ -65,16 +75,16 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--figure-style", choices=["prl", "nature"], help="Journal figure style preset (default: prl).")
     ap.add_argument("--plan-path", type=str, help="Optional explicit path to 01_plan.json (default: <paper-dir>/.workflow/01_plan.json).")
     ap.add_argument("--blueprint-path", type=str, help="v2 workspaces only: 01_blueprint.json, read for its figure list.")
-    ap.add_argument("--no-pause", dest="pause_after_story", action="store_false", default=None, help="full_auto: do not stop after the story stage for the author to read 01_story.md.")
-    ap.add_argument("--max-numeric-checks", type=int, default=None, help="check: how many core results get a scripted numeric check (default 4; 0 = none).")
-    ap.add_argument("--revise-low", action="store_true", default=None, help="revise: also revise files whose issues are all low severity (skipped by default).")
+    ap.add_argument("--no-pause", dest="pause_after_story", action="store_false", default=None, help="auto: unattended run; do not stop for the author (the agent chooses the story, concerns wait in the list).")
+    ap.add_argument("--max-numeric-checks", type=int, default=None, help="check: how many core results get a scripted numeric check (default from --effort: 0 / 4 / 10).")
+    ap.add_argument("--revise-low", action="store_true", default=None, help="revise: also revise files whose issues are all low severity (default: only at --effort high).")
     ap.add_argument("--supplement-tex", type=str, help="Optional path to Supplemental Material .tex.")
     ap.add_argument("--figure-specs-path", type=str, help="Optional JSON file describing target figures & captions.")
     ap.add_argument("--repair-instructions", type=str, help="--mode revise/repair: a referee or audit report path, or the instructions as text (default: the latest check report).")
     ap.add_argument("--repair-files", nargs="*", help="Optional target file subset for --mode revise with instructions.")
     ap.add_argument("--repair-skip-plan", action="store_true", default=None, help="--mode revise with instructions: skip the planner and hand each --repair-files file the full instructions (automatic for a single file).")
     ap.add_argument("--sync-bib", type=str, help="Optional external .bib to sync into refs.bib.")
-    ap.add_argument("--max-parallel", type=int, default=None, help="Maximum concurrent agent subprocesses (default: 4, or the value in --args-json).")
+    ap.add_argument("--max-parallel", type=int, default=None, help="Maximum concurrent agent subprocesses (default from --effort: 6 / 4 / 4).")
     ap.add_argument("--agent-timeout", type=int, default=None, help="Seconds before one agent call is killed together with its process tree (default: 1800).")
     ap.add_argument("--agent-retries", type=int, default=None, help="Retries for a failed or timed-out agent call (default: 2).")
     ap.add_argument("--max-scan-agents", type=int, default=None, help="Upper bound on Stage-0 scan agents (default: 24); the run stops instead of fanning out further.")
@@ -115,6 +125,11 @@ def main() -> int:
         ("plan_path", "plan_path"),
         ("blueprint_path", "blueprint_path"),
         ("pause_after_story", "pause_after_story"),
+        ("effort", "effort"),
+        ("start", "start"),
+        ("only_files", "only_files"),
+        ("reference_pdfs", "reference_pdfs"),
+        ("citation_notes_dir", "citation_notes_dir"),
         ("max_numeric_checks", "max_numeric_checks"),
         ("revise_low", "revise_low"),
         ("supplement_tex", "supplement_tex"),

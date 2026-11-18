@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "liber-paper"
-version = "3.1.0"
+version = "4.0.0"
 description = "Universal cross-agent LaTeX workflow & deterministic verification suite for theoretical and mathematical physics papers."
 readme = "README.md"
 license = { file = "LICENSE" }

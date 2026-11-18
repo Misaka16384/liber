@@ -1,6 +1,6 @@
 {
   "name": "write-paper",
-  "description": "Modular, re-entrant theoretical physics LaTeX paper workflow (v3, story first): material pack, verified lineage and a one-page story the author approves, one author drafting the main text block by block, a report-only check (scope, quantifiers, attribution, numbers, abstract read alone), author revision, deterministic clean-up and build, PRL/Nature figure gates, and an optional blind referee panel.",
+  "description": "Modular, re-entrant theoretical physics LaTeX paper workflow (v4: the author decides the story, AI writes and checks): starts from any stage on a paper at any completion; a briefing (results, verified literature map, open questions) for the author's story discussion; one author drafting only missing blocks; a report-only check; concerns that touch the story go back to the author; deterministic clean-up and build; effort levels; optional blind referee panel.",
   "entry": "paper_workflow.py",
   "args": {
     "type": "object",
@@ -8,6 +8,9 @@
       "mode": {
         "type": "string",
         "enum": [
+          "auto",
+          "survey",
+          "brief",
           "inventory",
           "story",
           "draft",
@@ -29,11 +32,49 @@
           "draft_and_audit",
           "audit_polish"
         ],
-        "description": "Phase or pipeline. v2 names are aliases: blueprint=story, verify/citations=check, hygiene=cleanup, repair=revise, draft_and_audit=draft_and_check, audit_polish=check_and_revise."
+        "description": "auto runs what the paper still needs from wherever it stands (stops for the author at the briefing, the story confirmation and blocking concerns); survey reports where it stands; or a single stage. Aliases: full_auto=auto, draft_and_check=auto from draft, check_and_revise=auto from check, blueprint=story, verify/citations=check, hygiene=cleanup, repair=revise."
       },
       "paper_dir": {
         "type": "string",
         "description": "Target LaTeX paper project root directory."
+      },
+      "effort": {
+        "type": "string",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "medium",
+        "description": "How much checking and literature work a run does: low (lineage only, no scripted numeric checks, reader check merged into the main-text check, 6 in parallel), medium, high (wider literature map, 10 numeric checks, low-severity fixes, a blind referee at the end). Explicit max_parallel / max_numeric_checks / revise_low win."
+      },
+      "start": {
+        "type": "string",
+        "enum": [
+          "",
+          "brief",
+          "story",
+          "draft",
+          "check",
+          "revise",
+          "build"
+        ],
+        "description": "auto: start at this stage and run to the end (brief reopens the story; check skips writing)."
+      },
+      "only_files": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Limit draft, check and revise to these files (relative to paper_dir)."
+      },
+      "reference_pdfs": {
+        "type": "string",
+        "description": "Folder of PDFs named <bibkey>.pdf; the citation check reads these in full when an abstract is not enough (otherwise it fetches the arXiv full text)."
+      },
+      "citation_notes_dir": {
+        "type": "string",
+        "description": "Where citation verdicts and per-work reading notes are kept (default <paper_dir>/.workflow/citation_notes); share one folder across papers to reuse them."
       },
       "source_paths": {
         "type": "array",
@@ -85,18 +126,16 @@
       "pause_after_story": {
         "type": "boolean",
         "default": true,
-        "description": "full_auto: stop after the story stage so the author can read (and edit) 01_story.md and 01_plan.json; then run draft_and_check."
+        "description": "auto: stop for the author at the briefing (story discussion), at the story confirmation and at blocking concerns. false = unattended: the agent chooses the story and concerns wait in 07_feedback.json."
       },
       "max_numeric_checks": {
         "type": "integer",
-        "default": 4,
         "minimum": 0,
-        "description": "check: how many core results (main-text ones first) get an independent scripted (SymPy/numerical) check; 0 = none."
+        "description": "check: how many core results (main-text ones first) get an independent scripted check (default from effort: low 0, medium 4, high 10)."
       },
       "revise_low": {
         "type": "boolean",
-        "default": false,
-        "description": "revise: also hand the author files whose issues are all low severity (copy-edit and flow hints); skipped by default."
+        "description": "revise: also hand the author files whose issues are all low severity (default: only at effort high)."
       },
       "check_backend": {
         "type": "string",
@@ -177,10 +216,9 @@
       },
       "max_parallel": {
         "type": "integer",
-        "default": 4,
         "minimum": 1,
         "maximum": 8,
-        "description": "Maximum concurrent agent calls per batch (default 4 to avoid RPC subscriber stalls)."
+        "description": "Maximum concurrent agent calls per batch (default from effort: low 6, medium 4, high 4)."
       },
       "agent_timeout_s": {
         "type": "integer",
